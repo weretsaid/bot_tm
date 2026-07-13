@@ -1,6 +1,7 @@
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.error import BadRequest, RetryAfter
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, PreCheckoutQueryHandler, filters, ContextTypes
 import json
 import os
 from datetime import datetime, timedelta
@@ -10,6 +11,10 @@ import signal
 import sys
 import threading
 import time
+import uuid
+import re
+import random
+from html import escape, unescape
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,7 +24,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Токен бота
-BOT_TOKEN = "8739623147:AAGPev_X54R2D8ujpTfwEpubthIKN8iONbQ"
+# Безопасно: токен берется из переменной окружения BOT_TOKEN.
+# Если запускаете на телефоне/хостинге без переменных окружения, вставьте НОВЫЙ токен ниже вместо текста-заглушки.
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "ВСТАВЬ_СЮДА_НОВЫЙ_ТОКЕН"
 
 ADMIN_GROUP_ID = -1003831040272
 CHANNEL_ID = -1003852570103
@@ -46,6 +53,12 @@ SEARCH_REQUESTS_FILE = "search_requests.json"
 TESTERS_FILE = "testers.json"
 AWARDS_FILE = "awards.json"
 ANNOUNCEMENTS_SETTINGS_FILE = "announcements_settings.json"
+REGISTRY_FILE = "registry.json"
+LEAGUES_FILE = "official_leagues.json"
+NOOFFICIAL_LEAGUES_FILE = "noofficial_leagues.json"
+MODER_COMPLAINTS_FILE = "moder_complaints.json"
+PAYMENTS_FILE = "payments.json"
+CIS_TOP_FILE = "cis_top.json"
 
 # Список наград
 AWARDS_LIST = {
@@ -64,7 +77,7 @@ CLUBS_STRUCTURE = [
     "Амстердам", "Барселона", "Буэнос-Айрес", "Валенсия", "Дортмунд",
     "Копенгаген", "Ливерпуль", "Лион", "Лиссабон", "Лондон", "Мадрид",
     "Манчестер", "Марсель", "Милан", "Монтеррей", "Мюнхен", "Париж",
-    "Порту", "Рио", "Роттердам", "Сан-Паулу", "Севилья", "Турин", "Штуттгарт"
+    "Порту", "Рио", "Роттердам", "Сан-Паулу", "Севилья", "Турин", "Касабланка"
 ]
 
 # Список сборных
@@ -74,33 +87,317 @@ NATIONS_STRUCTURE = [
     "Сенегал", "Украина", "Уругвай", "Франция", "Хорватия", "Швейцария"
 ]
 
+# Premium-эмодзи флагов для реестра сборных.
+# ID взяты из предоставленного пользователем списка.
+NATION_PREMIUM_EMOJI_IDS = {
+    "Англия": "5861763797848430616",
+    "Аргентина": "5864005001977796225",
+    "Бразилия": "5861928887801353324",
+    "Германия": "5863949485230528632",
+    "Египет": "5872749435133368089",
+    "Испания": "5861576017583282214",
+    "Италия": "5864126424998221302",
+    "Колумбия": "5875203253028787552",
+    "Марокко": "5873021920743531162",
+    "Португалия": "5863760631223555671",
+    "Сенегал": "5872968079033505699",
+    "Камерун": "5267063672353628633",
+    "Россия": "5965041620830132773",
+    "Украина": "5981178143673686647",
+    "Уругвай": "5861456218060496438",
+    "Франция": "5861861027318076721",
+    "Хорватия": "5864221575703697153",
+    "Швейцария": "5872828342272530884",
+}
+
+NATION_FLAG_FALLBACKS = {
+    "Англия": "🏴\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F",
+    "Аргентина": "🇦🇷",
+    "Бразилия": "🇧🇷",
+    "Германия": "🇩🇪",
+    "Египет": "🇪🇬",
+    "Испания": "🇪🇸",
+    "Италия": "🇮🇹",
+    "Камерун": "🇨🇲",
+    "Колумбия": "🇨🇴",
+    "Марокко": "🇲🇦",
+    "Португалия": "🇵🇹",
+    "Россия": "🇷🇺",
+    "Сенегал": "🇸🇳",
+    "Украина": "🇺🇦",
+    "Уругвай": "🇺🇾",
+    "Франция": "🇫🇷",
+    "Хорватия": "🇭🇷",
+    "Швейцария": "🇨🇭",
+}
+
 MAX_PLAYERS_PER_CLUB = 12
 MAX_PLAYERS_PER_NATION = 12
+MAX_SAME_CLUB_PER_NATION = 3
 SEARCH_COOLDOWN_HOURS = 2
 RECRUITMENT_LIMIT_PER_DAY = 2
 TRANSFER_COOLDOWN_SECONDS = 180
+MODERATOR_ONLINE_MINUTES = 5
+DONATE_PRICES = {
+    "restore": 50,
+    "cooldown": 15,
+    "unban": 50,
+    "premium": 75,
+}
+
+RUSSIAN_MONTHS = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+}
+
+def format_history_month(month_key):
+    """Возвращает подпись месяца формата YYYY-MM для интерфейса истории."""
+    try:
+        year_str, month_str = str(month_key).split("-", 1)
+        month_number = int(month_str)
+        return f"{RUSSIAN_MONTHS.get(month_number, month_str)} {int(year_str)}"
+    except (TypeError, ValueError):
+        return str(month_key)
+
+_DATA_LOCK = threading.RLock()
+CLUB_RENAMES = {"Штуттгарт": "Касабланка"}
+POSITION_RENAMES = {"🛡️ Защитник": "🔄 Полузащитник"}
+
+def get_default_file_data(filename):
+    if filename == ADMINS_FILE:
+        return {"admins": []}
+    if filename == BANS_FILE:
+        return {"banned": [], "ban_info": {}}
+    if filename == HISTORY_FILE:
+        return {"transfers": [], "career_changes": []}
+    if filename == PREMIUM_USERS_FILE:
+        return {"premium": []}
+    if filename == TESTERS_FILE:
+        return {"testers": []}
+    if filename == ANNOUNCEMENTS_SETTINGS_FILE:
+        return {"announcements_open": True}
+    if filename == REGISTRY_FILE:
+        return {"clubs": CLUBS_STRUCTURE.copy(), "nations": NATIONS_STRUCTURE.copy()}
+    if filename in {LEAGUES_FILE, NOOFFICIAL_LEAGUES_FILE}:
+        return {"leagues": []}
+    if filename == MODER_COMPLAINTS_FILE:
+        return {}
+    if filename == PAYMENTS_FILE:
+        return {"processed": {}}
+    if filename == CIS_TOP_FILE:
+        return {"ranking": [], "streaks": {}, "matches": [], "season_started": None}
+    return {}
 
 def load_data(filename, default=None):
     if default is None:
-        default = {}
+        default = get_default_file_data(filename)
     try:
-        if os.path.exists(filename):
-            with open(filename, 'r', encoding='utf-8') as f:
-                return json.load(f)
+        with _DATA_LOCK:
+            if os.path.exists(filename):
+                with open(filename, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if not content:
+                        return default.copy() if isinstance(default, dict) else default
+                    return json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON поврежден в {filename}: {e}")
     except Exception as e:
         logger.error(f"Ошибка загрузки {filename}: {e}")
-    return default
+    return default.copy() if isinstance(default, dict) else default
 
 def save_data(filename, data):
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        with _DATA_LOCK:
+            tmp_filename = f"{filename}.tmp"
+            with open(tmp_filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_filename, filename)
     except Exception as e:
         logger.error(f"Ошибка сохранения {filename}: {e}")
 
+def new_request_id(storage):
+    while True:
+        request_id = uuid.uuid4().hex[:12]
+        if str(request_id) not in storage:
+            return str(request_id)
+
+def premium_moderator_suffix(user_id, action, moderator_name):
+    """Показывает имя модератора пользователю только при наличии премиума."""
+    if not is_premium(int(user_id)):
+        return ""
+    safe_name = escape(str(moderator_name or "Без username"))
+    labels = {
+        "accepted": f"✅ Вашу заявку принял @{safe_name}",
+        "approved": f"✅ Одобрил: @{safe_name}",
+        "rejected": f"❌ Отклонил: @{safe_name}",
+        "ignored": f"😴 Проигнорировал: @{safe_name}",
+        "answered": f"✅ Ответил: @{safe_name}",
+        "performed": f"✅ Операцию выполнил: @{safe_name}",
+    }
+    line = labels.get(action)
+    return f"\n\n{line}" if line else ""
+
+def replace_exact_string_in_obj(obj, old_name, new_name):
+    """Меняет только точные значения/ключи, не затрагивая произвольные тексты пользователей."""
+    changed = False
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            value = obj[key]
+            if key == old_name:
+                if new_name not in obj:
+                    obj[new_name] = obj.pop(key)
+                    key = new_name
+                    value = obj[key]
+                    changed = True
+            if isinstance(value, str) and value == old_name:
+                obj[key] = new_name
+                changed = True
+            elif isinstance(value, (dict, list)):
+                changed = replace_exact_string_in_obj(value, old_name, new_name) or changed
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            if isinstance(value, str) and value == old_name:
+                obj[index] = new_name
+                changed = True
+            elif isinstance(value, (dict, list)):
+                changed = replace_exact_string_in_obj(value, old_name, new_name) or changed
+    return changed
+
+def find_case_insensitive(items, query):
+    query_normalized = str(query).strip().casefold()
+    for item in items:
+        if str(item).casefold() == query_normalized:
+            return item
+    return None
+
+def validate_registry_name(name):
+    name = " ".join(str(name).strip().split())
+    if not name:
+        return False, "Название не может быть пустым."
+    if len(name.encode("utf-8")) > 30:
+        return False, "Название слишком длинное для кнопок Telegram."
+    if "_" in name or "|" in name:
+        return False, "В названии нельзя использовать символы _ и |."
+    if any(ord(ch) < 32 for ch in name):
+        return False, "Название содержит недопустимые символы."
+    return True, name
+
+def normalize_username(username):
+    return str(username or "").strip().lstrip("@").casefold()
+
+def normalize_admin_ids(raw_admins):
+    result = []
+    for admin_id in raw_admins:
+        try:
+            normalized = int(admin_id)
+        except (TypeError, ValueError):
+            continue
+        if normalized not in result:
+            result.append(normalized)
+    if CREATOR_ID not in result:
+        result.insert(0, CREATOR_ID)
+    return result
+
+def normalize_payment_payload(payload):
+    parts = str(payload or "").split(":")
+    if len(parts) != 4 or parts[0] != "tm_donate":
+        return None
+    return {"action": parts[1], "user_id": parts[2], "nonce": parts[3]}
+
+def normalize_club_name(name):
+    return CLUB_RENAMES.get(name, name)
+
+def replace_renamed_clubs_in_obj(obj):
+    changed = False
+    if isinstance(obj, dict):
+        for key, value in list(obj.items()):
+            if isinstance(value, str) and value in CLUB_RENAMES:
+                obj[key] = CLUB_RENAMES[value]
+                changed = True
+            elif isinstance(value, str) and value in POSITION_RENAMES:
+                obj[key] = POSITION_RENAMES[value]
+                changed = True
+            elif isinstance(value, (dict, list)):
+                changed = replace_renamed_clubs_in_obj(value) or changed
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            if isinstance(value, str) and value in CLUB_RENAMES:
+                obj[index] = CLUB_RENAMES[value]
+                changed = True
+            elif isinstance(value, str) and value in POSITION_RENAMES:
+                obj[index] = POSITION_RENAMES[value]
+                changed = True
+            elif isinstance(value, (dict, list)):
+                changed = replace_renamed_clubs_in_obj(value) or changed
+    return changed
+
+def is_roblox_nick_taken(nick, users, exclude_user_id=None):
+    nick_normalized = str(nick).strip().lower()
+    if not nick_normalized or nick_normalized == "не указан":
+        return False
+    exclude_user_id = str(exclude_user_id) if exclude_user_id is not None else None
+    for uid, user in users.items():
+        if exclude_user_id is not None and str(uid) == exclude_user_id:
+            continue
+        if str(user.get('roblox_nick', '')).strip().lower() == nick_normalized:
+            return True
+    return False
+
+def ensure_user_record(users, user_id, username=None, first_name=None):
+    user_id_str = str(user_id)
+    if user_id_str not in users:
+        users[user_id_str] = {
+            "user_id": user_id_str,
+            "username": username,
+            "first_name": first_name,
+            "roblox_nick": "Не указан",
+            "position": "Не выбрана",
+            "career_active": True,
+            "career_end_date": None,
+            "club": None,
+            "nation": None,
+            "club_owner": None,
+            "nation_owner": None,
+            "ban_history": [],
+            "transfer_history": [],
+            "last_club": None,
+            "last_nation": None,
+            "last_search_club_date": None,
+            "last_search_nation_date": None,
+            "recruitment_club_dates": [],
+            "recruitment_nation_dates": [],
+            "registration_date": datetime.now().isoformat(),
+            "last_nick_change": None,
+            "last_transfer_club_date": None,
+            "last_transfer_nation_date": None,
+            "last_transfer_cmd": None,
+            "searches_today": 0,
+            "last_search_reset": None,
+            "registration_completed": False,
+            "registration_stage": "nick"
+        }
+    if "ban_history" not in users[user_id_str]:
+        users[user_id_str]["ban_history"] = []
+    users[user_id_str].setdefault("cis_top_notifications", False)
+    users[user_id_str].setdefault("cis_match_notifications", False)
+    return users[user_id_str]
+
 def is_admin(user_id):
     admins = load_data(ADMINS_FILE, {"admins": []})
-    return user_id == CREATOR_ID or user_id in admins["admins"]
+    try:
+        user_id_int = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    admin_ids = []
+    for admin_id in admins.get("admins", []):
+        try:
+            admin_ids.append(int(admin_id))
+        except (TypeError, ValueError):
+            continue
+    return user_id_int == CREATOR_ID or user_id_int in admin_ids
 
 def is_tester(user_id):
     testers = load_data(TESTERS_FILE, {"testers": []})
@@ -109,7 +406,8 @@ def is_tester(user_id):
 
 def is_banned(user_id):
     bans = load_data(BANS_FILE, {"banned": []})
-    return user_id in bans["banned"]
+    user_id_str = str(user_id)
+    return any(str(banned_id) == user_id_str for banned_id in bans.get("banned", []))
 
 def is_premium(user_id):
     premium_users = load_data(PREMIUM_USERS_FILE, {"premium": []})
@@ -140,8 +438,9 @@ def get_user_by_nick_or_id(query, users):
 
 def get_ban_info(user_id):
     bans = load_data(BANS_FILE, {"banned": [], "ban_info": {}})
-    if user_id in bans["banned"]:
-        ban_info = bans.get("ban_info", {}).get(str(user_id), {})
+    user_id_str = str(user_id)
+    if any(str(banned_id) == user_id_str for banned_id in bans.get("banned", [])):
+        ban_info = bans.get("ban_info", {}).get(user_id_str, {})
         return True, ban_info
     return False, None
 
@@ -176,45 +475,147 @@ def get_nation_players_count(nation_name, users):
             count += 1
     return count
 
+def two_column_keyboard(buttons):
+    """Располагает кнопки по две в строке; последняя остаётся одна при нечётном количестве."""
+    return [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+
+
+def back_keyboard(callback_data="back_to_menu", text="◀️ Назад"):
+    """Единая кнопка возврата для всех экранов, кроме главного меню."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=callback_data)]])
+
+
+def add_back_to_rows(rows, callback_data="back_to_menu", text="◀️ Назад"):
+    """Добавляет кнопку «Назад», если её ещё нет в клавиатуре."""
+    normalized = [list(row) for row in rows]
+    has_back = any(
+        getattr(button, "callback_data", "") in {callback_data, "back_to_menu"}
+        or "Назад" in str(getattr(button, "text", ""))
+        for row in normalized for button in row
+    )
+    if not has_back:
+        normalized.append([InlineKeyboardButton(text, callback_data=callback_data)])
+    return normalized
+
+
+def nation_premium_emoji(nation_name):
+    fallback = NATION_FLAG_FALLBACKS.get(nation_name, "🌏")
+    emoji_id = NATION_PREMIUM_EMOJI_IDS.get(nation_name)
+    if not emoji_id:
+        return fallback
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
 def format_club_list():
-    result = "📋 СПИСОК КЛУБОВ С ВЛАДЕЛЬЦАМИ:\n\n"
+    result = "<b><u>📋 СПИСОК КЛУБОВ С ВЛАДЕЛЬЦАМИ</u></b>\n\n"
     users = load_data(USERS_FILE)
     frozen = load_data(FROZEN_CLUBS_FILE, {})
-    
+
     for club in CLUBS_STRUCTURE:
         owner = None
         for uid, user in users.items():
             if user.get('club_owner') == club:
                 owner = user
                 break
-        
+
         players_count = get_club_players_count(club, users)
-        frozen_status = " ❄️(ЗАМОРОЖЕН)" if club in frozen else ""
-        
+        frozen_status = " ❄️ <b>(ЗАМОРОЖЕН)</b>" if club in frozen else ""
+        safe_club = escape(str(club))
+
         if owner:
-            result += f"  • {club}{frozen_status} — 👑 {owner.get('roblox_nick')} (@{owner.get('username')}) — 👥 {players_count}/{MAX_PLAYERS_PER_CLUB}\n"
+            owner_nick = escape(str(owner.get('roblox_nick') or 'Не указан'))
+            owner_username = escape(str(owner.get('username') or 'Нет username'))
+            result += (
+                f"  • <b>{safe_club}</b>{frozen_status} — 👑 <i>{owner_nick}</i> "
+                f"(@{owner_username}) — 👥 <code>{players_count}/{MAX_PLAYERS_PER_CLUB}</code>\n"
+            )
         else:
-            result += f"  • {club}{frozen_status} — 👑 — 👥 {players_count}/{MAX_PLAYERS_PER_CLUB}\n"
+            result += f"  • <b>{safe_club}</b>{frozen_status} — 👑 — 👥 <code>{players_count}/{MAX_PLAYERS_PER_CLUB}</code>\n"
     return result
 
 def format_nation_list():
-    result = "🌏 СПИСОК СБОРНЫХ С ВЛАДЕЛЬЦАМИ:\n\n"
+    result = "<b><u>🌏 СПИСОК СБОРНЫХ С ВЛАДЕЛЬЦАМИ</u></b>\n\n"
     users = load_data(USERS_FILE)
-    
+
     for nation in NATIONS_STRUCTURE:
         owner = None
         for uid, user in users.items():
             if user.get('nation_owner') == nation:
                 owner = user
                 break
-        
+
         players_count = get_nation_players_count(nation, users)
-        
+        flag = nation_premium_emoji(nation)
+        safe_nation = escape(str(nation))
+
         if owner:
-            result += f"  • {nation} — 👑 {owner.get('roblox_nick')} (@{owner.get('username')}) — 👥 {players_count}/{MAX_PLAYERS_PER_NATION}\n"
+            owner_nick = escape(str(owner.get('roblox_nick') or 'Не указан'))
+            owner_username = escape(str(owner.get('username') or 'Нет username'))
+            result += (
+                f"  • {flag} <b>{safe_nation}</b> — 👑 <i>{owner_nick}</i> "
+                f"(@{owner_username}) — 👥 <code>{players_count}/{MAX_PLAYERS_PER_NATION}</code>\n"
+            )
         else:
-            result += f"  • {nation} — 👑 — 👥 {players_count}/{MAX_PLAYERS_PER_NATION}\n"
+            result += f"  • {flag} <b>{safe_nation}</b> — 👑 — 👥 <code>{players_count}/{MAX_PLAYERS_PER_NATION}</code>\n"
     return result
+
+
+def position_emoji(position):
+    value = str(position or "")
+    if "Нападающий" in value:
+        return "⚽"
+    if "Полузащитник" in value:
+        return "🎯"
+    if "Универсал" in value:
+        return "🔄"
+    if "Вратарь" in value:
+        return "🧤"
+    return "❓"
+
+
+def count_same_club_in_nation(nation_name, club_name, users, exclude_user_id=None):
+    """Считает активных игроков одной сборной из одного клуба."""
+    if not nation_name or not club_name:
+        return 0
+    excluded = str(exclude_user_id) if exclude_user_id is not None else None
+    count = 0
+    for uid, user in users.items():
+        if excluded is not None and str(uid) == excluded:
+            continue
+        if not user.get("career_active", True):
+            continue
+        if user.get("nation") == nation_name and user.get("club") == club_name:
+            count += 1
+    return count
+
+
+def can_assign_player_to_nation(user_id, nation_name, users):
+    """Проверяет лимит: максимум 3 игрока из одного клуба в одной сборной."""
+    user = users.get(str(user_id), {})
+    club_name = user.get("club")
+    if not club_name:
+        return True, None
+    current = count_same_club_in_nation(nation_name, club_name, users, exclude_user_id=user_id)
+    if current >= MAX_SAME_CLUB_PER_NATION:
+        return False, (
+            f"❌ Нельзя добавить игрока в сборную {nation_name}: "
+            f"в ней уже {MAX_SAME_CLUB_PER_NATION} игрока из клуба {club_name}."
+        )
+    return True, None
+
+
+def can_assign_player_to_club(user_id, club_name, users):
+    """Не допускает обход лимита через последующий переход игрока в клуб."""
+    user = users.get(str(user_id), {})
+    nation_name = user.get("nation")
+    if not nation_name:
+        return True, None
+    current = count_same_club_in_nation(nation_name, club_name, users, exclude_user_id=user_id)
+    if current >= MAX_SAME_CLUB_PER_NATION:
+        return False, (
+            f"❌ Переход нарушит правило сборных: в сборной {nation_name} уже "
+            f"{MAX_SAME_CLUB_PER_NATION} игрока из клуба {club_name}."
+        )
+    return True, None
 
 def can_play_for_club(user_id, user):
     if user.get('club_owner'):
@@ -226,32 +627,62 @@ def can_play_for_nation(user_id, user):
         return False, "❌ Вы не можете завершить карьеру, так как вы являетесь владельцем сборной!\n\nЧтобы завершить карьеру, обратитесь к администраторам для закрытия или передачи сборной."
     return True, None
 
+async def safe_send_message(bot, chat_id, text, reply_markup=None, parse_mode=None):
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as e:
+        if parse_mode == 'HTML':
+            logger.warning(f"HTML parse error, повтор без HTML: {e}")
+            plain_text = unescape(re.sub(r"<[^>]+>", "", text))
+            return await bot.send_message(chat_id=chat_id, text=plain_text, reply_markup=reply_markup)
+        raise
+
+def style_template_heading(text):
+    """Делает первую строку шаблона заметной, сохраняя готовую HTML-разметку."""
+    text = str(text)
+    first_line, separator, remainder = text.partition("\n")
+    if re.search(r"</?(?:b|u|i|code|tg-emoji)\b", first_line, flags=re.IGNORECASE):
+        return text
+    styled_first = f"<b><u>{escape(first_line)}</u></b>"
+    return styled_first + (separator + remainder if separator else "")
+
+
 async def send_to_admin_group(bot, text, reply_markup=None):
     # Всегда отправляем в группу админов, проверка на открытые объявления не нужна для отправки
     try:
-        if reply_markup:
-            await bot.send_message(chat_id=ADMIN_GROUP_ID, text=text, reply_markup=reply_markup, parse_mode='HTML')
-        else:
-            await bot.send_message(chat_id=ADMIN_GROUP_ID, text=text, parse_mode='HTML')
+        text = style_template_heading(text)
+        await safe_send_message(bot, ADMIN_GROUP_ID, text, reply_markup=reply_markup, parse_mode='HTML')
         logger.info(f"Сообщение отправлено в группу админов")
     except Exception as e:
         logger.error(f"Ошибка отправки в группу админов: {e}")
 
 async def send_to_channel(bot, text):
     try:
-        await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode='HTML')
+        text = style_template_heading(text)
+        await safe_send_message(bot, CHANNEL_ID, text, parse_mode='HTML')
         logger.info(f"Сообщение отправлено в канал")
     except Exception as e:
         logger.error(f"Ошибка отправки в канал: {e}")
 
 async def send_to_match_group(bot, text):
     try:
-        await bot.send_message(chat_id=MATCH_SEARCH_GROUP_ID, text=text, parse_mode='HTML')
+        text = style_template_heading(text)
+        await safe_send_message(bot, MATCH_SEARCH_GROUP_ID, text, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Ошибка отправки в группу матчей: {e}")
 
 def make_copyable(text):
-    return f"<code>{text}</code>"
+    return f"<code>{escape(str(text))}</code>"
+
+def html_text(text):
+    return escape(str(text))
+
+async def safe_reply_html(message, text, **kwargs):
+    try:
+        return await message.reply_text(text, parse_mode='HTML', **kwargs)
+    except BadRequest as e:
+        logger.warning(f"HTML parse error, отправляем без HTML: {e}")
+        return await message.reply_text(text.replace("<code>", "").replace("</code>", ""), **kwargs)
 
 def get_current_datetime():
     now = datetime.now()
@@ -340,7 +771,489 @@ class FootballBot:
         self.testers = load_data(TESTERS_FILE, {"testers": []})
         self.awards = load_data(AWARDS_FILE, {})
         self.announcements_settings = load_data(ANNOUNCEMENTS_SETTINGS_FILE, {"announcements_open": True})
+        self.registry = load_data(REGISTRY_FILE, {"clubs": CLUBS_STRUCTURE.copy(), "nations": NATIONS_STRUCTURE.copy()})
+        self.leagues = load_data(LEAGUES_FILE, {"leagues": []})
+        self.noofficial_leagues = load_data(NOOFFICIAL_LEAGUES_FILE, {"leagues": []})
+        self.moder_complaints = load_data(MODER_COMPLAINTS_FILE, {})
+        self.payments = load_data(PAYMENTS_FILE, {"processed": {}})
+        self.cis_top = load_data(CIS_TOP_FILE, {"ranking": [], "streaks": {}, "matches": [], "season_started": None})
+        CLUBS_STRUCTURE[:] = [normalize_club_name(name) for name in self.registry.get("clubs", CLUBS_STRUCTURE)]
+        NATIONS_STRUCTURE[:] = self.registry.get("nations", NATIONS_STRUCTURE)
+        self._save_registry()
+        self.migrate_renamed_clubs()
+        self.ensure_cis_top()
         
+    def migrate_renamed_clubs(self):
+        files_to_check = [
+            (USERS_FILE, self.users),
+            (TRANSFERS_FILE, self.transfers),
+            (ADS_FILE, self.ads),
+            (HISTORY_FILE, self.history),
+            (TRANSFER_REQUESTS_FILE, self.transfer_requests),
+            (OWNER_CHANGE_REQUESTS_FILE, self.owner_change_requests),
+            (FROZEN_CLUBS_FILE, self.frozen_clubs),
+            (SEARCH_REQUESTS_FILE, self.search_requests),
+            (MATCH_REQUESTS_FILE, self.match_requests),
+            (CIS_TOP_FILE, self.cis_top),
+        ]
+        for filename, data in files_to_check:
+            if replace_renamed_clubs_in_obj(data):
+                save_data(filename, data)
+
+    def touch_user_activity(self, tg_user):
+        """Фиксирует активность именно внутри бота.
+
+        Telegram Bot API не передаёт ботам настоящий системный статус online/offline,
+        поэтому статус модератора считается по его последнему сообщению или нажатию
+        кнопки в этом боте.
+        """
+        if not tg_user:
+            return
+        user_id = str(tg_user.id)
+        record = ensure_user_record(
+            self.users,
+            user_id,
+            username=tg_user.username,
+            first_name=tg_user.first_name
+        )
+        now = datetime.now()
+        now_ts = int(time.time())
+        previous_saved_ts = int(record.get("last_activity_saved_ts") or 0)
+        record["username"] = tg_user.username
+        record["first_name"] = tg_user.first_name
+        record["last_seen"] = now.isoformat()
+        record["last_activity_ts"] = now_ts
+
+        # Для модераторов сохраняем активность чаще, чтобы /moders не показывал
+        # устаревший статус после перезапуска. Для остальных пользователей запись
+        # ограничена разом в минуту, чтобы не перегружать JSON-файл.
+        save_interval = 10 if is_admin(int(user_id)) else 60
+        if now_ts - previous_saved_ts >= save_interval:
+            record["last_activity_saved_ts"] = now_ts
+            save_data(USERS_FILE, self.users)
+
+    async def track_activity(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.touch_user_activity(update.effective_user)
+
+    async def _reply_or_edit(self, update: Update, text, reply_markup=None, parse_mode=None):
+        if update.callback_query:
+            try:
+                return await update.callback_query.edit_message_text(
+                    text=text, reply_markup=reply_markup, parse_mode=parse_mode
+                )
+            except BadRequest as exc:
+                if "Message is not modified" not in str(exc):
+                    raise
+                return None
+        return await update.message.reply_text(
+            text=text, reply_markup=reply_markup, parse_mode=parse_mode
+        )
+
+    async def _finish_rejection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, status_text):
+        original_message = context.user_data.get("reject_original_message")
+        if original_message:
+            base_text = original_message.text or ""
+            try:
+                await original_message.edit_text(f"{base_text}\n\n{status_text}")
+            except BadRequest as exc:
+                logger.warning(f"Не удалось изменить исходную заявку: {exc}")
+        if update.message:
+            await update.message.reply_text("✅ Заявка отклонена, причина отправлена пользователю.")
+        elif update.callback_query and not original_message:
+            await update.callback_query.edit_message_text(status_text)
+
+    def _save_registry(self):
+        self.registry = {
+            "clubs": CLUBS_STRUCTURE.copy(),
+            "nations": NATIONS_STRUCTURE.copy(),
+        }
+        save_data(REGISTRY_FILE, self.registry)
+
+    def ensure_cis_top(self):
+        """Создаёт случайный стартовый ТОП один раз и поддерживает реестр в актуальном виде."""
+        ranking = self.cis_top.get("ranking")
+        if not isinstance(ranking, list):
+            ranking = []
+        ranking = [club for club in ranking if club in CLUBS_STRUCTURE]
+        missing = [club for club in CLUBS_STRUCTURE if club not in ranking]
+        if not ranking:
+            ranking = CLUBS_STRUCTURE.copy()
+            random.SystemRandom().shuffle(ranking)
+            self.cis_top["season_started"] = datetime.now().isoformat()
+        elif missing:
+            random.SystemRandom().shuffle(missing)
+            ranking.extend(missing)
+        self.cis_top["ranking"] = ranking
+        self.cis_top.setdefault("streaks", {})
+        self.cis_top.setdefault("matches", [])
+        self.cis_top.setdefault("season_started", datetime.now().isoformat())
+        save_data(CIS_TOP_FILE, self.cis_top)
+
+    def get_cis_rank(self, club_name):
+        self.ensure_cis_top()
+        try:
+            return self.cis_top["ranking"].index(club_name) + 1
+        except ValueError:
+            return None
+
+    def format_cis_top(self, user_id):
+        self.ensure_cis_top()
+        premium = is_premium(int(user_id))
+        limit = 15 if premium else 10
+        ranking = self.cis_top.get("ranking", [])[:limit]
+        text = "<b><u>🌍 ТОП СНГ</u></b>\n\n"
+        for place, club in enumerate(ranking, start=1):
+            streak = self.cis_top.get("streaks", {}).get(club, {})
+            streak_text = ""
+            if streak.get("count", 0) > 0 and streak.get("opponent"):
+                streak_text = f" — 🔥 <code>{streak['count']}/3</code> против <i>{escape(str(streak['opponent']))}</i>"
+            text += f"<b>{place}.</b> {escape(str(club))}{streak_text}\n"
+        text += (
+            "\n<i>Для повышения команда должна 3 раза подряд победить одну и ту же "
+            "команду, которая находится выше.</i>\n"
+            "<i>Учитываются только официальные матчи; технические победы засчитываются.</i>"
+        )
+        if not premium:
+            text += "\n\n💎 Премиум-пользователям доступен ТОП-15."
+        return text
+
+    async def cis_top_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        if is_banned(int(user_id)):
+            await update.message.reply_text("❌ Вы забанены в боте.")
+            return
+        markup = back_keyboard() if update.effective_chat.type == "private" else None
+        await safe_send_message(
+            context.bot,
+            update.effective_chat.id,
+            self.format_cis_top(user_id),
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+
+    async def show_cis_top_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        await self._reply_or_edit(
+            update,
+            self.format_cis_top(user_id),
+            reply_markup=back_keyboard("back_to_menu"),
+            parse_mode="HTML"
+        )
+
+    async def notify_cis_subscribers(self, bot, text, match_only=False):
+        """Уведомляет подписчиков с защитой от flood limit."""
+        for uid, user in list(self.users.items()):
+            if match_only:
+                if not is_premium(int(uid)) or not user.get("cis_match_notifications", False):
+                    continue
+            elif not user.get("cis_top_notifications", False):
+                continue
+            try:
+                await bot.send_message(chat_id=int(uid), text=text, parse_mode="HTML")
+                await asyncio.sleep(0.05)
+            except RetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 0.5)
+                try:
+                    await bot.send_message(chat_id=int(uid), text=text, parse_mode="HTML")
+                except Exception as retry_exc:
+                    logger.warning(f"Не удалось повторно уведомить {uid} о ТОП СНГ: {retry_exc}")
+            except Exception as exc:
+                logger.warning(f"Не удалось уведомить {uid} о ТОП СНГ: {exc}")
+
+    def record_cis_match(self, winner, loser, admin_id, technical=False):
+        """Записывает официальный матч и автоматически обрабатывает страйк 3/3."""
+        self.ensure_cis_top()
+        ranking = self.cis_top["ranking"]
+        if winner == loser:
+            raise ValueError("Команда не может играть сама с собой")
+        winner_index = ranking.index(winner)
+        loser_index = ranking.index(loser)
+        winner_was_below = winner_index > loser_index
+
+        streaks = self.cis_top.setdefault("streaks", {})
+        current = streaks.get(winner, {})
+        if winner_was_below:
+            if current.get("opponent") == loser:
+                count = int(current.get("count", 0)) + 1
+            else:
+                count = 1
+            streaks[winner] = {
+                "opponent": loser,
+                "count": count,
+                "updated_at": datetime.now().isoformat(),
+            }
+        else:
+            count = 0
+            streaks[winner] = {"opponent": None, "count": 0, "updated_at": datetime.now().isoformat()}
+
+        # Поражение прерывает собственную серию проигравшей команды.
+        streaks[loser] = {"opponent": None, "count": 0, "updated_at": datetime.now().isoformat()}
+
+        match_entry = {
+            "id": uuid.uuid4().hex[:12],
+            "winner": winner,
+            "loser": loser,
+            "technical": bool(technical),
+            "admin_id": str(admin_id),
+            "timestamp": datetime.now().isoformat(),
+            "streak_after": count,
+        }
+        self.cis_top.setdefault("matches", []).append(match_entry)
+        self.cis_top["matches"] = self.cis_top["matches"][-1000:]
+
+        changed = False
+        old_winner_place = winner_index + 1
+        old_loser_place = loser_index + 1
+        if winner_was_below and count >= 3:
+            ranking[winner_index], ranking[loser_index] = ranking[loser_index], ranking[winner_index]
+            streaks[winner] = {"opponent": None, "count": 0, "updated_at": datetime.now().isoformat()}
+            changed = True
+
+        save_data(CIS_TOP_FILE, self.cis_top)
+        return {
+            "changed": changed,
+            "count": count,
+            "winner_was_below": winner_was_below,
+            "old_winner_place": old_winner_place,
+            "old_loser_place": old_loser_place,
+            "new_winner_place": self.get_cis_rank(winner),
+            "new_loser_place": self.get_cis_rank(loser),
+            "technical": bool(technical),
+        }
+
+    def move_cis_club_to_bottom(self, club_name):
+        self.ensure_cis_top()
+        ranking = self.cis_top["ranking"]
+        if club_name not in ranking:
+            return None
+        old_place = ranking.index(club_name) + 1
+        if old_place == len(ranking):
+            return None
+        ranking.remove(club_name)
+        ranking.append(club_name)
+        self.cis_top.get("streaks", {}).pop(club_name, None)
+        save_data(CIS_TOP_FILE, self.cis_top)
+        return {"old_place": old_place, "new_place": len(ranking)}
+
+    def resolve_club_name(self, raw_name):
+        value = str(raw_name or "").strip().strip('"').strip("'")
+        for club in CLUBS_STRUCTURE:
+            if club.casefold() == value.casefold():
+                return club
+        return None
+
+    async def cis_match_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        admin_id = str(update.effective_user.id)
+        if not is_admin(int(admin_id)):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        raw = update.message.text.partition(" ")[2].strip()
+        if not raw or "+1" not in raw:
+            await update.message.reply_text("❌ Использование: /match Победитель +1 Проигравший [тех]")
+            return
+        winner_raw, loser_raw = re.split(r"\s*\+1\s*", raw, maxsplit=1)
+        technical = False
+        tech_match = re.search(r"\s+(тех|техническая|technical)$", loser_raw, flags=re.IGNORECASE)
+        if tech_match:
+            technical = True
+            loser_raw = loser_raw[:tech_match.start()].strip()
+        winner = self.resolve_club_name(winner_raw)
+        loser = self.resolve_club_name(loser_raw)
+        if not winner or not loser:
+            await update.message.reply_text("❌ Не удалось найти одну из команд. Проверьте названия из /clubs.")
+            return
+        if winner == loser:
+            await update.message.reply_text("❌ Победитель и проигравший не могут быть одной командой.")
+            return
+        result = self.record_cis_match(winner, loser, admin_id, technical=technical)
+        match_type = "техническая победа" if technical else "официальный матч"
+        if result["winner_was_below"]:
+            streak_line = f"🔥 Страйк {winner}: {result['count']}/3 против {loser}"
+        else:
+            streak_line = "ℹ️ Страйк на повышение не начислен: победитель уже находился выше соперника."
+        response = (
+            f"✅ Результат добавлен ({match_type}).\n\n"
+            f"🏆 {winner} +1\n❌ {loser}\n{streak_line}"
+        )
+        if result["changed"]:
+            response += (
+                f"\n\n📈 ТОП СНГ изменён: {winner} поднялся с {result['old_winner_place']} "
+                f"на {result['new_winner_place']} место, {loser} перемещён на {result['new_loser_place']} место."
+            )
+        await update.message.reply_text(response)
+
+        premium_text = (
+            f"<b>⚽ Матч ТОП СНГ</b>\n\n"
+            f"🏆 {escape(winner)} — победа\n"
+            f"❌ {escape(loser)} — поражение\n"
+            f"🔥 Страйк: <code>{result['count']}/3</code>"
+        )
+        await self.notify_cis_subscribers(context.bot, premium_text, match_only=True)
+
+        if result["changed"]:
+            admin_notice = (
+                f"<b>🌍 ТОП СНГ ИЗМЕНЁН</b>\n\n"
+                f"📈 {escape(winner)}: <code>{result['old_winner_place']}</code> → <code>{result['new_winner_place']}</code>\n"
+                f"📉 {escape(loser)}: <code>{result['old_loser_place']}</code> → <code>{result['new_loser_place']}</code>\n"
+                f"🔥 Причина: 3 победы подряд над одной командой."
+            )
+            await send_to_admin_group(context.bot, admin_notice)
+            await self.notify_cis_subscribers(context.bot, admin_notice, match_only=False)
+
+    async def set_cis_top_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        raw = update.message.text.partition(" ")[2].strip()
+        if "|" not in raw:
+            await update.message.reply_text("❌ Использование: /set_top_cis Название клуба | место")
+            return
+        club_raw, place_raw = [part.strip() for part in raw.split("|", 1)]
+        club = self.resolve_club_name(club_raw)
+        try:
+            place = int(place_raw)
+        except ValueError:
+            place = 0
+        self.ensure_cis_top()
+        ranking = self.cis_top["ranking"]
+        if not club or not 1 <= place <= len(ranking):
+            await update.message.reply_text("❌ Клуб или место указаны неверно.")
+            return
+        old_place = ranking.index(club) + 1
+        ranking.remove(club)
+        ranking.insert(place - 1, club)
+        save_data(CIS_TOP_FILE, self.cis_top)
+        text = f"✅ {club}: {old_place} → {place} место в ТОП СНГ."
+        await update.message.reply_text(text)
+        notice = f"<b>🌍 ТОП СНГ ИЗМЕНЁН ВРУЧНУЮ</b>\n\n{escape(club)}: <code>{old_place}</code> → <code>{place}</code>"
+        await send_to_admin_group(context.bot, notice)
+        await self.notify_cis_subscribers(context.bot, notice)
+
+    async def swap_cis_top_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        raw = update.message.text.partition(" ")[2].strip()
+        if "|" not in raw:
+            await update.message.reply_text("❌ Использование: /swap_top_cis Клуб 1 | Клуб 2")
+            return
+        first_raw, second_raw = [part.strip() for part in raw.split("|", 1)]
+        first = self.resolve_club_name(first_raw)
+        second = self.resolve_club_name(second_raw)
+        if not first or not second or first == second:
+            await update.message.reply_text("❌ Проверьте названия клубов.")
+            return
+        ranking = self.cis_top["ranking"]
+        first_index, second_index = ranking.index(first), ranking.index(second)
+        ranking[first_index], ranking[second_index] = ranking[second_index], ranking[first_index]
+        save_data(CIS_TOP_FILE, self.cis_top)
+        await update.message.reply_text(f"✅ {first} и {second} поменяны местами.")
+        notice = f"<b>🌍 ТОП СНГ ИЗМЕНЁН ВРУЧНУЮ</b>\n\n{escape(first)} ↔️ {escape(second)}"
+        await send_to_admin_group(context.bot, notice)
+        await self.notify_cis_subscribers(context.bot, notice)
+
+    async def reset_cis_top_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        ranking = CLUBS_STRUCTURE.copy()
+        random.SystemRandom().shuffle(ranking)
+        self.cis_top = {
+            "ranking": ranking,
+            "streaks": {},
+            "matches": [],
+            "season_started": datetime.now().isoformat(),
+        }
+        save_data(CIS_TOP_FILE, self.cis_top)
+        await update.message.reply_text("✅ Новый сезон ТОП СНГ запущен. Команды расставлены случайно.")
+        notice = "<b>🌍 НОВЫЙ СЕЗОН ТОП СНГ</b>\n\nКоманды расставлены в случайном порядке."
+        await send_to_admin_group(context.bot, notice)
+        await self.notify_cis_subscribers(context.bot, notice)
+
+    async def cis_streaks_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        active = []
+        for club, data in self.cis_top.get("streaks", {}).items():
+            if data.get("count", 0) and data.get("opponent"):
+                active.append((club, data))
+        if not active:
+            await update.message.reply_text("🔥 Активных страйков сейчас нет.")
+            return
+        text = "<b>🔥 АКТИВНЫЕ СТРАЙКИ ТОП СНГ</b>\n\n"
+        for club, data in sorted(active, key=lambda item: item[1].get("count", 0), reverse=True):
+            text += f"• {escape(club)} — <code>{data['count']}/3</code> против {escape(str(data['opponent']))}\n"
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def show_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        user = ensure_user_record(self.users, user_id)
+        top_enabled = user.get("cis_top_notifications", False)
+        match_enabled = user.get("cis_match_notifications", False)
+        top_status = "✅ Вкл" if top_enabled else "⛔ Выкл"
+        match_status = "✅ Вкл" if match_enabled else "⛔ Выкл"
+
+        buttons = [
+            InlineKeyboardButton("✏️ Сменить ник", callback_data="change_nick"),
+            InlineKeyboardButton("💠 Выбрать позицию", callback_data="set_position"),
+            InlineKeyboardButton("🔄 Обновить username", callback_data="update_username"),
+            InlineKeyboardButton(f"🔔 Изменения ТОП: {top_status}", callback_data="toggle_cis_top_notifications"),
+        ]
+        if is_premium(int(user_id)):
+            buttons.append(
+                InlineKeyboardButton(
+                    f"🔥 Матчи/страйки: {match_status}",
+                    callback_data="toggle_cis_match_notifications"
+                )
+            )
+        buttons.append(InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"))
+
+        premium_line = (
+            f"🔥 <b>Матчи и страйки</b> — уведомления об официальных матчах и сериях побед. "
+            f"Сейчас: <code>{'Включены' if match_enabled else 'Выключены'}</code>."
+            if is_premium(int(user_id))
+            else "🔥 <b>Матчи и страйки</b> — дополнительные уведомления, доступные только с премиумом."
+        )
+        text = (
+            "<b><u>⚙️ НАСТРОЙКИ</u></b>\n\n"
+            "<b>Доступные действия:</b>\n"
+            "✏️ <b>Сменить ник</b> — отправить заявку на изменение Roblox-ника.\n"
+            "💠 <b>Выбрать позицию</b> — изменить основную позицию на поле.\n"
+            "🔄 <b>Обновить username</b> — сохранить ваш текущий Telegram @Username.\n"
+            f"🔔 <b>Изменения ТОП СНГ</b> — уведомления о перестановках команд. "
+            f"Сейчас: <code>{'Включены' if top_enabled else 'Выключены'}</code>.\n"
+            f"{premium_line}\n\n"
+            "<i>Уведомления по умолчанию выключены. Нажмите кнопку повторно, чтобы изменить состояние.</i>"
+        )
+        await self._reply_or_edit(
+            update,
+            text,
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons)),
+            parse_mode="HTML"
+        )
+
+    def _rename_entity_references(self, old_name, new_name):
+        storages = [
+            (USERS_FILE, self.users),
+            (TRANSFERS_FILE, self.transfers),
+            (ADS_FILE, self.ads),
+            (CAREER_FILE, self.career_ends),
+            (SUPPORT_FILE, self.support),
+            (HISTORY_FILE, self.history),
+            (NICK_CHANGE_REQUESTS_FILE, self.nick_requests),
+            (TRANSFER_REQUESTS_FILE, self.transfer_requests),
+            (CAREER_REQUESTS_FILE, self.career_requests),
+            (MATCH_REQUESTS_FILE, self.match_requests),
+            (OWNER_CHANGE_REQUESTS_FILE, self.owner_change_requests),
+            (FROZEN_CLUBS_FILE, self.frozen_clubs),
+            (SEARCH_REQUESTS_FILE, self.search_requests),
+            (CIS_TOP_FILE, self.cis_top),
+        ]
+        for filename, storage in storages:
+            if replace_exact_string_in_obj(storage, old_name, new_name):
+                save_data(filename, storage)
+
     def has_username(self, user_id):
         user = self.users.get(str(user_id), {})
         username = user.get('username', '')
@@ -682,7 +1595,7 @@ class FootballBot:
         try:
             await context.bot.send_message(
                 chat_id=int(target_user_id),
-                text=f"🏆 Вам выдана награда {award_emoji} {award_text}!\n\n✅ Администратор: @{update.effective_user.username}"
+                text=f"🏆 Вам выдана награда {award_emoji} {award_text}!{premium_moderator_suffix(target_user_id, 'performed', update.effective_user.username)}"
             )
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
@@ -715,7 +1628,7 @@ class FootballBot:
             try:
                 await context.bot.send_message(
                     chat_id=int(target_user_id),
-                    text=f"❌ Администратор удалил все ваши награды!\n\n✅ Операцию выполнил: @{update.effective_user.username}"
+                    text=f"❌ Администратор удалил все ваши награды!{premium_moderator_suffix(target_user_id, 'performed', update.effective_user.username)}"
                 )
             except Exception as e:
                 logger.error(f"Ошибка уведомления пользователя: {e}")
@@ -841,16 +1754,26 @@ class FootballBot:
         return club_players, return_date
     
     async def unfreeze_club(self, club_name):
-        if club_name in self.frozen_clubs:
-            saved_players = self.frozen_clubs[club_name].get("saved_players", [])
-            for uid in saved_players:
-                if uid in self.users:
-                    self.users[uid]['club'] = club_name
-            save_data(USERS_FILE, self.users)
-            del self.frozen_clubs[club_name]
-            save_data(FROZEN_CLUBS_FILE, self.frozen_clubs)
-            return saved_players
-        return []
+        if club_name not in self.frozen_clubs:
+            return []
+        saved_players = self.frozen_clubs[club_name].get("saved_players", [])
+        restored_players = []
+        blocked_players = []
+        for uid in saved_players:
+            if uid not in self.users:
+                continue
+            allowed, reason = can_assign_player_to_club(uid, club_name, self.users)
+            if allowed:
+                self.users[uid]['club'] = club_name
+                restored_players.append(uid)
+            else:
+                blocked_players.append({"user_id": uid, "reason": reason})
+        save_data(USERS_FILE, self.users)
+        del self.frozen_clubs[club_name]
+        save_data(FROZEN_CLUBS_FILE, self.frozen_clubs)
+        if blocked_players:
+            logger.warning(f"При разморозке {club_name} не возвращены игроки из-за лимита сборной: {blocked_players}")
+        return restored_players
     
     async def freeze_club_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
@@ -1025,11 +1948,218 @@ class FootballBot:
         
         await update.message.reply_text(text)
     
+    @staticmethod
+    def _normalize_history_club_name(club_name):
+        """Приводит старые служебные значения истории к понятному названию."""
+        value = str(club_name or "Свободный агент").strip()
+        if value.lower() in {
+            "выгнан", "кикнут", "исключён", "исключен",
+            "нет клуба", "none", "null", "-", ""
+        }:
+            return "Свободный агент"
+        return value
+
+    @staticmethod
+    def _parse_history_datetime(value):
+        """Безопасно разбирает дату из истории или профиля пользователя."""
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    def get_user_club_periods_by_month(self, user_id):
+        """
+        Собирает периоды нахождения игрока в клубах и группирует их по месяцу
+        начала периода. В историю включается статус свободного агента.
+        """
+        user_id_str = str(user_id)
+        user = self.users.get(user_id_str, {})
+        transitions = []
+
+        for transfer in self.history.get("transfers", []):
+            if str(transfer.get("user_id")) != user_id_str:
+                continue
+            if transfer.get("transfer_type", "club") != "club":
+                continue
+
+            transfer_date = self._parse_history_datetime(transfer.get("timestamp"))
+            if transfer_date is None:
+                continue
+
+            transitions.append({
+                "timestamp": transfer_date,
+                "from_club": self._normalize_history_club_name(transfer.get("from_club")),
+                "to_club": self._normalize_history_club_name(transfer.get("to_club")),
+            })
+
+        transitions.sort(key=lambda item: item["timestamp"])
+        current_club = self._normalize_history_club_name(user.get("club"))
+        registration_date = self._parse_history_datetime(user.get("registration_date"))
+        periods = []
+
+        if transitions:
+            first_transition = transitions[0]
+            first_start = registration_date
+            if first_start is None or first_start > first_transition["timestamp"]:
+                first_start = first_transition["timestamp"]
+
+            # Клуб, из которого игрок совершил первый сохранённый переход.
+            periods.append({
+                "club": first_transition["from_club"],
+                "start": first_start,
+                "end": first_transition["timestamp"],
+                "current": False,
+            })
+
+            # Каждый новый клуб действует до следующего сохранённого перехода.
+            for index, transition in enumerate(transitions):
+                next_transition = transitions[index + 1] if index + 1 < len(transitions) else None
+                period_club = transition["to_club"]
+                period_end = next_transition["timestamp"] if next_transition else None
+
+                # Текущее состояние профиля является источником истины для
+                # последнего периода, даже если старая история была неполной.
+                if next_transition is None:
+                    period_club = current_club
+
+                periods.append({
+                    "club": period_club,
+                    "start": transition["timestamp"],
+                    "end": period_end,
+                    "current": next_transition is None,
+                })
+        else:
+            # Для старого профиля без истории показываем хотя бы текущее состояние.
+            if registration_date is not None or current_club != "Свободный агент":
+                periods.append({
+                    "club": current_club,
+                    "start": registration_date or datetime.now(),
+                    "end": None,
+                    "current": True,
+                })
+
+        grouped = {}
+        for period in periods:
+            start_date = period.get("start")
+            if start_date is None:
+                continue
+            month_key = start_date.strftime("%Y-%m")
+            grouped.setdefault(month_key, []).append(period)
+
+        for month_periods in grouped.values():
+            month_periods.sort(key=lambda item: item.get("start") or datetime.min)
+
+        # История читается сверху вниз по времени: старые месяцы → новые.
+        return dict(sorted(grouped.items(), key=lambda item: item[0]))
+
+    def get_user_club_history_by_month(self, user_id):
+        """Совместимость со старым названием функции истории."""
+        return self.get_user_club_periods_by_month(user_id)
+
+    def build_personal_history_chunks(self, user_id, max_length=3900):
+        """Формирует HTML-историю периодов в клубах без кнопок месяцев."""
+        user_id_str = str(user_id)
+        user = self.users.get(user_id_str, {})
+        grouped = self.get_user_club_periods_by_month(user_id_str)
+        current_club = escape(self._normalize_history_club_name(user.get("club")))
+        player_nick = escape(str(user.get("roblox_nick") or "Не указан"))
+
+        intro = (
+            f"<b>📜 История трансферов <u>{player_nick}</u></b>\n\n"
+            f"📌 Текущий клуб: <b>{current_club}</b>"
+        )
+
+        if not grouped:
+            return [intro + "\n\n<i>История трансферов пока пуста.</i>"]
+
+        chunks = []
+        current = intro
+
+        for month_key, periods in grouped.items():
+            month_title = escape(format_history_month(month_key))
+            month_header = f"\n\n<b><u>📅 {month_title}</u></b>"
+
+            if len(current) + len(month_header) > max_length:
+                chunks.append(current)
+                current = (
+                    f"<b>📜 История трансферов <u>{player_nick}</u></b>\n\n"
+                    f"<b><u>📅 {month_title}</u></b>"
+                )
+            else:
+                current += month_header
+
+            for period in periods:
+                club_name = escape(str(period.get("club") or "Свободный агент"))
+                start_date = period.get("start")
+                end_date = period.get("end")
+                start_text = start_date.strftime("%d.%m.%Y") if start_date else "Дата неизвестна"
+
+                if period.get("current") or end_date is None:
+                    end_html = "<i>Сейчас</i>"
+                else:
+                    end_html = f"<code>{end_date.strftime('%d.%m.%Y')}</code>"
+
+                entry = (
+                    f"\n\n• <b>{club_name}</b>: "
+                    f"<code>{start_text}</code> — {end_html}"
+                )
+
+                if len(current) + len(entry) > max_length:
+                    chunks.append(current)
+                    current = (
+                        f"<b>📜 История трансферов <u>{player_nick}</u></b>\n\n"
+                        f"<b><u>📅 {month_title}</u></b>"
+                        + entry
+                    )
+                else:
+                    current += entry
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+    async def history_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.show_history_index(update, context)
+
+    async def show_history_index(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        chunks = self.build_personal_history_chunks(user_id)
+        is_private = update.effective_chat.type == "private"
+
+        for index, chunk in enumerate(chunks):
+            is_last = index == len(chunks) - 1
+            markup = back_keyboard() if is_private and is_last else None
+
+            if index == 0:
+                await self._reply_or_edit(
+                    update,
+                    chunk,
+                    reply_markup=markup,
+                    parse_mode="HTML"
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=chunk,
+                    reply_markup=markup,
+                    parse_mode="HTML"
+                )
+
+    async def show_history_month(self, update: Update, context: ContextTypes.DEFAULT_TYPE, month_key=None, page=0):
+        """Старые кнопки истории перенаправляются на новый текстовый формат."""
+        await self.show_history_index(update, context)
+
     async def transfer_cl_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         
         if is_banned(int(user_id)):
-            await update.message.reply_text("❌ Вы забанены в боте.")
+            await update.message.reply_text(
+                "<b>❌ Вы забанены в боте.</b>\n\nВы можете приобрести разбан через Telegram Stars.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Купить разбан — 50 ⭐", callback_data="donate_unban")]]),
+                parse_mode='HTML'
+            )
             return
         
         user = self.users.get(user_id, {})
@@ -1204,11 +2334,247 @@ class FootballBot:
         
         await update.message.reply_text(f"✅ Приглашения отправлены {sent_count} игрокам!")
     
+    def registration_is_pending(self, user_id):
+        """Определяет, должен ли пользователь пройти регистрацию новичка.
+
+        Новые записи создаются с registration_completed=False. Для старых записей,
+        где этого поля ещё нет, регистрация включается только тогда, когда профиль
+        действительно не заполнен. Пользователи с уже указанными ником и позицией
+        повторно проходить регистрацию не будут.
+        """
+        user_id_str = str(user_id)
+        user = self.users.get(user_id_str, {})
+
+        if "registration_completed" in user:
+            return user.get("registration_completed") is False
+
+        nick = str(user.get("roblox_nick") or "").strip()
+        position = str(user.get("position") or "").strip()
+        nick_missing = not nick or nick.lower() == "не указан"
+        position_missing = not position or position.lower() == "не выбрана"
+
+        if nick_missing or position_missing:
+            user["registration_completed"] = False
+            if nick_missing:
+                user["registration_stage"] = "nick"
+            elif position_missing:
+                user["registration_stage"] = "position"
+            else:
+                user["registration_stage"] = "team"
+            self.users[user_id_str] = user
+            save_data(USERS_FILE, self.users)
+            return True
+
+        # Старый заполненный профиль считаем уже зарегистрированным.
+        user["registration_completed"] = True
+        user["registration_stage"] = "completed"
+        self.users[user_id_str] = user
+        save_data(USERS_FILE, self.users)
+        return False
+
+    async def show_registration_nick(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        user = self.users.get(user_id, {})
+        user["registration_stage"] = "nick"
+        user["registration_completed"] = False
+        save_data(USERS_FILE, self.users)
+        context.user_data.clear()
+        context.user_data["waiting_for"] = "registration_nick"
+        await self._reply_or_edit(
+            update,
+            "<b>✨ Добро пожаловать в Transfer Markt | Touch Football ✨</b>\n\n"
+            "В начале регистрации введите свой <b>ДИСПЛЕЙНЫЙ</b> ник из Roblox:",
+            parse_mode="HTML"
+        )
+
+    async def show_registration_position(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        user = self.users.get(user_id, {})
+        user["registration_stage"] = "position"
+        save_data(USERS_FILE, self.users)
+        context.user_data.clear()
+        buttons = [
+            InlineKeyboardButton("⚽ Нападающий", callback_data="registration_pos_forward"),
+            InlineKeyboardButton("🎯 Полузащитник", callback_data="registration_pos_midfielder"),
+            InlineKeyboardButton("🔄 Универсал", callback_data="registration_pos_universal"),
+            InlineKeyboardButton("🧤 Вратарь", callback_data="registration_pos_goalkeeper"),
+        ]
+        await self._reply_or_edit(
+            update,
+            "<b>💠 ВЫБОР ПОЗИЦИИ</b>\n\n"
+            "Последнее, что нужно сделать — выбрать свою <b>основную позицию</b> на поле:",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons)),
+            parse_mode="HTML"
+        )
+
+    async def show_registration_team_offer(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        user = self.users.get(user_id, {})
+        user["registration_stage"] = "team"
+        save_data(USERS_FILE, self.users)
+        context.user_data.clear()
+        buttons = [
+            InlineKeyboardButton("🔍 Найти команду", callback_data="registration_find_club"),
+            InlineKeyboardButton("⏭ Пропустить", callback_data="registration_skip_team"),
+        ]
+        await self._reply_or_edit(
+            update,
+            "<b>🔍 ПОИСК КОМАНДЫ</b>\n\n"
+            "Хотите сразу отправить заявку на поиск <b>клуба</b>?\n\n"
+            "Можно найти команду сейчас или пропустить этот шаг.",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons)),
+            parse_mode="HTML"
+        )
+
+    async def show_registration_features(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        user = self.users.get(user_id, {})
+        user["registration_stage"] = "features"
+        save_data(USERS_FILE, self.users)
+        context.user_data.clear()
+        text = (
+            "<b><u>📚 КОМАНДЫ И ВОЗМОЖНОСТИ БОТА</u></b>\n\n"
+            "<b>🔍 Возможности</b>\n"
+            "• Поиск клуба и сборной через модерацию\n"
+            "• Личный профиль, ник и игровая позиция\n"
+            "• Реестры клубов и сборных\n"
+            "• Объявления и набор игроков\n"
+            "• Управление клубом или сборной для владельцев\n"
+            "• Трансферы, история переходов и награды\n"
+            "• Техподдержка и жалобы на модераторов\n"
+            "• Донат через Telegram Stars\n\n"
+            "<b>📋 Пользовательские команды</b>\n"
+            "<code>/start</code> — главное меню\n"
+            "<code>/help</code> — помощь по боту\n"
+            "<code>/profile [ник/id]</code> — профиль игрока\n"
+            "<code>/clubs</code> — реестр клубов\n"
+            "<code>/nations</code> — реестр сборных\n"
+            "<code>/club [название]</code> — информация о клубе\n"
+            "<code>/nation [название]</code> — информация о сборной\n"
+            "<code>/top_cis</code> — посмотреть ТОП СНГ\n"
+            "<code>/history</code> — история ваших клубов по месяцам\n"
+            "<code>/moders</code> — список модераторов\n"
+            "<code>/official_league</code> — официальные лиги\n"
+            "<code>/noofficial_league</code> — неофициальные лиги\n"
+            "<code>/support_moder @Username причина</code> — жалоба на модератора\n\n"
+            "<i>Все основные функции также доступны кнопками в главном меню.</i>"
+        )
+        await self._reply_or_edit(
+            update,
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Дальше ➡️", callback_data="registration_continue")]]),
+            parse_mode="HTML"
+        )
+
+    async def resume_registration(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        user = self.users.get(user_id, {})
+        stage = user.get("registration_stage", "nick")
+        if stage == "position":
+            await self.show_registration_position(update, context)
+        elif stage == "team":
+            await self.show_registration_team_offer(update, context)
+        elif stage == "club_requirements":
+            context.user_data.clear()
+            context.user_data["waiting_for"] = "registration_search_requirements"
+            await self._reply_or_edit(
+                update,
+                "<b>🔍 ПОИСК КЛУБА</b>\n\nОпишите требования к будущему клубу:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="registration_team_offer")]]),
+                parse_mode="HTML"
+            )
+        elif stage == "features":
+            await self.show_registration_features(update, context)
+        else:
+            await self.show_registration_nick(update, context)
+
+    async def process_registration_club_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        user = self.users.get(user_id, {})
+        requirements = (update.message.text or "").strip()
+
+        if not requirements:
+            await update.message.reply_text("❌ Напишите требования к клубу текстом.")
+            return
+        if not update.effective_user.username:
+            await update.message.reply_text(
+                "❌ Для публикации заявки нужен @Username в Telegram. Установите username и повторите позже."
+            )
+            context.user_data.clear()
+            await self.show_registration_features(update, context)
+            return
+        if not are_announcements_open():
+            await update.message.reply_text("🔒 Сейчас заявки закрыты администраторами. Этот шаг можно пройти позже через главное меню.")
+            context.user_data.clear()
+            await self.show_registration_features(update, context)
+            return
+        can_search, time_left = self.can_search_club(user_id)
+        if not can_search:
+            await update.message.reply_text(f"❌ Поиск клуба пока недоступен. Осталось: {time_left}")
+            context.user_data.clear()
+            await self.show_registration_features(update, context)
+            return
+
+        request_id = new_request_id(self.search_requests)
+        self.search_requests[request_id] = {
+            "id": request_id,
+            "user_id": user_id,
+            "username": update.effective_user.username,
+            "roblox_nick": user.get("roblox_nick"),
+            "position": user.get("position"),
+            "requirements": requirements,
+            "search_type": "club",
+            "status": "pending",
+            "timestamp": datetime.now().isoformat()
+        }
+        save_data(SEARCH_REQUESTS_FILE, self.search_requests)
+
+        admin_text = (
+            "‼️ Новое объявление!\n\n"
+            "📢 Тип: Поиск клуба (Свободный агент)\n"
+            f"👤 От: @{escape(str(update.effective_user.username))}\n"
+            f"🆔 ID: {make_copyable(user_id)}\n\n"
+            f"💠 Ник: {make_copyable(user.get('roblox_nick', 'Не указан'))}\n"
+            f"⚽ Позиция: {escape(str(user.get('position', 'Не выбрана')))}\n"
+            f"📝 Требования: {make_copyable(requirements)}"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ ОДОБРИТЬ", callback_data=f"approve_search_{request_id}"),
+            InlineKeyboardButton("❌ ОТКЛОНИТЬ", callback_data=f"reject_search_{request_id}"),
+            InlineKeyboardButton("😴 Игнорировать", callback_data=f"ignore_search_{request_id}")
+        ]])
+        await send_to_admin_group(context.bot, admin_text, keyboard)
+        await update.message.reply_text(
+            "✅ Ваша заявка на поиск клуба отправлена администраторам на одобрение!\n\n"
+            "⏳ Ожидайте публикации в канале."
+        )
+        context.user_data.clear()
+        await self.show_registration_features(update, context)
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # /start и главное меню доступны только в личных сообщениях.
+        # Остальные команды по-прежнему зарегистрированы без ограничения по типу чата.
         if update.effective_chat.type != 'private':
-            await update.message.reply_text("❌ Главное меню доступно только в личных сообщениях с ботом!")
+            try:
+                bot_info = await context.bot.get_me()
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🤖 Открыть бота в ЛС",
+                        url=f"https://t.me/{bot_info.username}?start=menu"
+                    )
+                ]])
+            except Exception as exc:
+                logger.warning(f"Не удалось получить username бота для кнопки ЛС: {exc}")
+                keyboard = None
+
+            await update.message.reply_text(
+                "❌ Главное меню и регистрация доступны только в личных сообщениях с ботом!\n\n"
+                "Команды бота можно использовать и в этом чате.",
+                reply_markup=keyboard
+            )
             return
         
+        self.touch_user_activity(update.effective_user)
         user_id = str(update.effective_user.id)
         username = update.effective_user.username
         
@@ -1216,7 +2582,11 @@ class FootballBot:
             self.update_username(user_id, username)
         
         if is_banned(int(user_id)):
-            await update.message.reply_text("❌ Вы забанены в боте.")
+            await update.message.reply_text(
+                "<b>❌ Вы забанены в боте.</b>\n\nВы можете приобрести разбан через Telegram Stars.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Купить разбан — 50 ⭐", callback_data="donate_unban")]]),
+                parse_mode='HTML'
+            )
             return
         
         if user_id not in self.users:
@@ -1246,65 +2616,82 @@ class FootballBot:
                 "last_transfer_nation_date": None,
                 "last_transfer_cmd": None,
                 "searches_today": 0,
-                "last_search_reset": None
+                "last_search_reset": None,
+                "registration_completed": False,
+                "registration_stage": "nick"
             }
             save_data(USERS_FILE, self.users)
+
+        if self.registration_is_pending(user_id):
+            await self.resume_registration(update, context)
+            return
         
         await self.show_main_menu(update, context)
     
     async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if hasattr(update.effective_chat, 'type') and update.effective_chat.type != 'private':
             return
-        
+
+        self.touch_user_activity(update.effective_user)
         user_id = str(update.effective_user.id)
         user = self.users.get(user_id, {})
-        
-        if is_banned(int(user_id)):
-            if update.callback_query:
-                await update.callback_query.message.edit_text("❌ Вы забанены в боте.")
-            else:
-                await update.message.reply_text("❌ Вы забанены в боте.")
+
+        if self.registration_is_pending(user_id):
+            await self.resume_registration(update, context)
             return
-        
+
+        if is_banned(int(user_id)):
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⭐ Купить разбан — 50 ⭐", callback_data="donate_unban")]
+            ])
+            await self._reply_or_edit(
+                update,
+                "<b>❌ Вы забанены в боте.</b>\n\nВы можете приобрести разбан через Telegram Stars.",
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+            return
+
         career_active = user.get('career_active', True)
-        
-        keyboard = [
-            [InlineKeyboardButton("🔍 Ищу клуб/сборную", callback_data="search_menu")],
-            [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
+        buttons = [
+            InlineKeyboardButton("🔍 Ищу клуб/сборную", callback_data="search_menu"),
+            InlineKeyboardButton("👤 Профиль", callback_data="profile"),
         ]
-        
-        if user.get('club_owner'):
-            keyboard.append([InlineKeyboardButton("👑 Управление клубом", callback_data="club_management")])
-        
-        if user.get('nation_owner'):
-            keyboard.append([InlineKeyboardButton("🌏 Управление сборной", callback_data="nation_management")])
-        
-        if career_active:
-            keyboard.append([InlineKeyboardButton("📢 Объявление", callback_data="ad_menu"),
-                           InlineKeyboardButton("⚙️ Настройки", callback_data="settings")])
-            keyboard.append([InlineKeyboardButton("🥀 Завершить карьеру", callback_data="end_career_confirm")])
-        else:
-            keyboard.append([InlineKeyboardButton("🔄 Вернуть карьеру", callback_data="restore_career_confirm")])
-        
-        keyboard.append([InlineKeyboardButton("🆘 Техподдержка", callback_data="support_menu")])
-        keyboard.append([InlineKeyboardButton("ℹ️ Помощь", callback_data="help")])
-        
+
         if is_admin(int(user_id)):
-            keyboard.insert(1, [InlineKeyboardButton("🚫 Админ панель", callback_data="admin")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        if update.callback_query:
-            await update.callback_query.message.edit_text(
-                "🏠 Главное меню\nВыберите раздел:",
-                reply_markup=reply_markup
-            )
+            buttons.append(InlineKeyboardButton("🚫 Админ панель", callback_data="admin"))
+
+        if user.get('club_owner'):
+            buttons.append(InlineKeyboardButton("👑 Управление клубом", callback_data="club_management"))
+        if user.get('nation_owner'):
+            buttons.append(InlineKeyboardButton("🌏 Управление сборной", callback_data="nation_management"))
+
+        if career_active:
+            buttons.extend([
+                InlineKeyboardButton("📢 Объявление", callback_data="ad_menu"),
+                InlineKeyboardButton("🥀 Завершить карьеру", callback_data="end_career_confirm"),
+            ])
         else:
-            await update.message.reply_text(
-                "🏠 Главное меню\nВыберите раздел:",
-                reply_markup=reply_markup
-            )
-    
+            # Бесплатная заявка на досрочный возврат отключена. Кнопка открывает
+            # защищённый счёт Telegram Stars и исчезает после успешной оплаты.
+            buttons.append(InlineKeyboardButton("🔒 Вернуть карьеру — 50 ⭐", callback_data="donate_restore"))
+
+        buttons.extend([
+            InlineKeyboardButton("🆘 Техподдержка", callback_data="support_menu"),
+            InlineKeyboardButton("👑 Модераторы", callback_data="moders"),
+            InlineKeyboardButton("⭐ Донат", callback_data="donate_menu"),
+            InlineKeyboardButton("🌍 ТОП СНГ", callback_data="cis_top"),
+            InlineKeyboardButton("ℹ️ Помощь", callback_data="help"),
+            InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
+        ])
+
+        await self._reply_or_edit(
+            update,
+            "<b>🏠 Главное меню</b>\n\nВыберите раздел:",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons)),
+            parse_mode='HTML'
+        )
+
     async def search_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = str(query.from_user.id)
@@ -1333,16 +2720,16 @@ class FootballBot:
             await query.edit_message_text("❌ Сначала выберите позицию в настройках!")
             return
         
-        keyboard = []
+        buttons = []
         if not user.get('club_owner'):
-            keyboard.append([InlineKeyboardButton("🛡 Клубы", callback_data="search_clubs")])
+            buttons.append(InlineKeyboardButton("🛡 Клубы", callback_data="search_clubs"))
         if not user.get('nation_owner'):
-            keyboard.append([InlineKeyboardButton("🌏 Сборные", callback_data="search_nations")])
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")])
+            buttons.append(InlineKeyboardButton("🌏 Сборные", callback_data="search_nations"))
+        buttons.append(InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"))
         
         await query.edit_message_text(
             "🔍 ВЫБЕРИТЕ НАПРАВЛЕНИЕ ПОИСКА:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons))
         )
     
     async def search_clubs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1370,11 +2757,9 @@ class FootballBot:
         
         if user.get('club') is not None:
             old_club = user.get('club')
-            self.users[user_id]['club'] = None
-            save_data(USERS_FILE, self.users)
-            await query.edit_message_text(f"📢 Вы покинули клуб {old_club} и стали свободным агентом!\n\nТеперь опишите требования к новому клубу:")
+            await query.edit_message_text(f"<b>📢 ПОИСК НОВОГО КЛУБА</b>\n\nПосле одобрения заявки вы покинете клуб <i>{escape(str(old_club))}</i> и будете опубликованы как свободный агент!\n\nТеперь опишите требования к новому клубу:", reply_markup=back_keyboard("search_menu"), parse_mode='HTML')
         else:
-            await query.edit_message_text("🔍 Вы уже свободный агент.\n\nОпишите требования к клубу:")
+            await query.edit_message_text("<b>🔍 ПОИСК КЛУБА</b>\n\nВы уже свободный агент.\n\n<i>Опишите требования к клубу:</i>", reply_markup=back_keyboard("search_menu"), parse_mode='HTML')
         
         context.user_data['waiting_for'] = 'search_requirements'
         context.user_data['search_type'] = 'club'
@@ -1404,11 +2789,9 @@ class FootballBot:
         
         if user.get('nation') is not None:
             old_nation = user.get('nation')
-            self.users[user_id]['nation'] = None
-            save_data(USERS_FILE, self.users)
-            await query.edit_message_text(f"📢 Вы покинули сборную {old_nation} и стали свободным агентом!\n\nТеперь опишите требования к новой сборной:")
+            await query.edit_message_text(f"<b>📢 ПОИСК НОВОЙ СБОРНОЙ</b>\n\nПосле одобрения заявки вы покинете сборную <i>{escape(str(old_nation))}</i> и будете опубликованы как свободный агент!\n\nТеперь опишите требования к новой сборной:", reply_markup=back_keyboard("search_menu"), parse_mode='HTML')
         else:
-            await query.edit_message_text("🔍 Вы уже свободный агент.\n\nОпишите требования к сборной:")
+            await query.edit_message_text("<b>🔍 ПОИСК СБОРНОЙ</b>\n\nВы уже свободный агент.\n\n<i>Опишите требования к сборной:</i>", reply_markup=back_keyboard("search_menu"), parse_mode='HTML')
         
         context.user_data['waiting_for'] = 'search_requirements'
         context.user_data['search_type'] = 'nation'
@@ -1422,17 +2805,17 @@ class FootballBot:
             await query.edit_message_text("🔒 В настоящее время администраторы не принимают заявки. Попробуйте позже.")
             return
         
-        keyboard = []
+        buttons = []
         if user.get('club_owner'):
-            keyboard.append([InlineKeyboardButton("👑 Набор в клуб", callback_data="ad_recruitment_club")])
+            buttons.append(InlineKeyboardButton("👑 Набор в клуб", callback_data="ad_recruitment_club"))
         if user.get('nation_owner'):
-            keyboard.append([InlineKeyboardButton("🌏 Набор в сборную", callback_data="ad_recruitment_nation")])
-        keyboard.append([InlineKeyboardButton("📢 Реклама ТФ канала", callback_data="ad_channel")])
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")])
+            buttons.append(InlineKeyboardButton("🌏 Набор в сборную", callback_data="ad_recruitment_nation"))
+        buttons.append(InlineKeyboardButton("📢 Реклама ТФ канала", callback_data="ad_channel"))
+        buttons.append(InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"))
         
         await query.edit_message_text(
             "📢 ВЫБЕРИТЕ ТИП ОБЪЯВЛЕНИЯ:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons))
         )
     
     async def ad_recruitment_club(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1456,7 +2839,8 @@ class FootballBot:
         context.user_data['ad_type'] = 'recruitment_club'
         context.user_data['waiting_for'] = 'ad_text'
         await query.edit_message_text(
-            f"👑 НАБОР В КЛУБ {user.get('club_owner')}\n\nНапишите текст объявления:"
+            f"<b>👑 НАБОР В КЛУБ</b> <i>{escape(str(user.get('club_owner')))}</i>\n\nНапишите текст объявления:",
+            reply_markup=back_keyboard("ad_menu"), parse_mode='HTML'
         )
     
     async def ad_recruitment_nation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1480,7 +2864,8 @@ class FootballBot:
         context.user_data['ad_type'] = 'recruitment_nation'
         context.user_data['waiting_for'] = 'ad_text'
         await query.edit_message_text(
-            f"🌏 НАБОР В СБОРНУЮ {user.get('nation_owner')}\n\nНапишите текст объявления:"
+            f"<b>🌏 НАБОР В СБОРНУЮ</b> <i>{escape(str(user.get('nation_owner')))}</i>\n\nНапишите текст объявления:",
+            reply_markup=back_keyboard("ad_menu"), parse_mode='HTML'
         )
     
     async def ad_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1494,7 +2879,8 @@ class FootballBot:
         context.user_data['ad_type'] = 'channel'
         context.user_data['waiting_for'] = 'ad_text'
         await query.edit_message_text(
-            "📢 РЕКЛАМА ТЕЛЕГРАМ КАНАЛА\n\nНапишите текст рекламного объявления:"
+            "<b><u>📢 РЕКЛАМА TELEGRAM-КАНАЛА</u></b>\n\n<i>Напишите текст рекламного объявления:</i>",
+            reply_markup=back_keyboard("ad_menu"), parse_mode='HTML'
         )
     
     async def clubs_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1502,172 +2888,103 @@ class FootballBot:
         if is_banned(int(user_id)):
             await update.message.reply_text("❌ Вы забанены в боте.")
             return
-        await update.message.reply_text(format_club_list())
+        await safe_send_message(context.bot, update.effective_chat.id, format_club_list(), reply_markup=back_keyboard(), parse_mode='HTML')
     
     async def nations_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         if is_banned(int(user_id)):
             await update.message.reply_text("❌ Вы забанены в боте.")
             return
-        await update.message.reply_text(format_nation_list())
+        await safe_send_message(context.bot, update.effective_chat.id, format_nation_list(), reply_markup=back_keyboard(), parse_mode='HTML')
     
     async def nation_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         if is_banned(int(user_id)):
             await update.message.reply_text("❌ Вы забанены в боте.")
             return
-        
         if not context.args:
             await update.message.reply_text("❌ Использование: /nation [название сборной]")
             return
-        
         nation_name = ' '.join(context.args)
-        nation_found = None
-        for nation in NATIONS_STRUCTURE:
-            if nation.lower() == nation_name.lower():
-                nation_found = nation
-                break
-        
+        nation_found = next((nation for nation in NATIONS_STRUCTURE if nation.casefold() == nation_name.casefold()), None)
         if not nation_found:
             await update.message.reply_text(f"❌ Сборная '{nation_name}' не найдена!")
             return
-        
+
         owner = None
+        nation_players = []
         for uid, user in self.users.items():
             if user.get('nation_owner') == nation_found:
                 owner = user
-                break
-        
-        nation_players = []
-        for uid, user in self.users.items():
             if user.get('nation') == nation_found and user.get('career_active', True):
-                nation_players.append(user)
-        
-        forwards = [p for p in nation_players if p.get('position') == '⚽ Нападающий']
-        midfielders = [p for p in nation_players if p.get('position') == '🔄 Полузащитник']
-        defenders = [p for p in nation_players if p.get('position') == '🛡️ Защитник']
-        goalkeepers = [p for p in nation_players if p.get('position') == '🧤 Вратарь']
-        unknown = [p for p in nation_players if p.get('position') == 'Не выбрана']
-        
-        text = f"🌏 СБОРНАЯ: {nation_found}\n\n"
+                nation_players.append((uid, user))
+
+        text = f"<b><u>🌏 СБОРНАЯ: {escape(nation_found)}</u></b>\n\n"
         if owner:
-            text += f"👑 Владелец: {owner.get('roblox_nick')} (@{owner.get('username')})\n"
+            text += f"👑 Владелец: <b>{escape(str(owner.get('roblox_nick') or 'Не указан'))}</b> (@{escape(str(owner.get('username') or 'Нет username'))})\n"
         else:
-            text += f"👑 Владелец: Нет\n"
-        text += f"👥 Игроков: {len(nation_players)}/{MAX_PLAYERS_PER_NATION}\n\n"
-        
-        if forwards:
-            text += "⚽ НАПАДАЮЩИЕ:\n"
-            for p in forwards:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-            text += "\n"
-        
-        if midfielders:
-            text += "🔄 ПОЛУЗАЩИТНИКИ:\n"
-            for p in midfielders:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-            text += "\n"
-        
-        if defenders:
-            text += "🛡️ ЗАЩИТНИКИ:\n"
-            for p in defenders:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-            text += "\n"
-        
-        if goalkeepers:
-            text += "🧤 ВРАТАРИ:\n"
-            for p in goalkeepers:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-            text += "\n"
-        
-        if unknown:
-            text += "❓ БЕЗ ПОЗИЦИИ:\n"
-            for p in unknown:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-        
-        if not nation_players:
+            text += "👑 Владелец: <i>Нет</i>\n"
+        text += f"👥 Игроков: <code>{len(nation_players)}/{MAX_PLAYERS_PER_NATION}</code>\n"
+        text += f"📌 Правило: максимум <b>{MAX_SAME_CLUB_PER_NATION}</b> игрока из одного клуба.\n\n"
+
+        if nation_players:
+            for uid, player in sorted(nation_players, key=lambda item: str(item[1].get('roblox_nick', '')).casefold()):
+                club = escape(str(player.get('club') or 'Свободный агент'))
+                nick = escape(str(player.get('roblox_nick') or 'Не указан'))
+                text += f"{position_emoji(player.get('position'))} | <b>{nick}</b> | {club}\n"
+        else:
             text += "📭 В сборной пока нет игроков\n"
-        
-        await update.message.reply_text(text)
+
+        markup = back_keyboard() if update.effective_chat.type == 'private' else None
+        await safe_send_message(context.bot, update.effective_chat.id, text, reply_markup=markup, parse_mode='HTML')
     
     async def club_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         if is_banned(int(user_id)):
             await update.message.reply_text("❌ Вы забанены в боте.")
             return
-        
         if not context.args:
             await update.message.reply_text("❌ Использование: /club [название клуба]")
             return
-        
         club_name = ' '.join(context.args)
-        club_found = None
-        for club in CLUBS_STRUCTURE:
-            if club.lower() == club_name.lower():
-                club_found = club
-                break
-        
+        club_found = self.resolve_club_name(club_name)
         if not club_found:
             await update.message.reply_text(f"❌ Клуб '{club_name}' не найден!")
             return
-        
+
         owner = None
+        club_players = []
         for uid, user in self.users.items():
             if user.get('club_owner') == club_found:
                 owner = user
-                break
-        
-        club_players = []
-        for uid, user in self.users.items():
             if user.get('club') == club_found and user.get('career_active', True):
-                club_players.append(user)
-        
-        forwards = [p for p in club_players if p.get('position') == '⚽ Нападающий']
-        midfielders = [p for p in club_players if p.get('position') == '🔄 Полузащитник']
-        defenders = [p for p in club_players if p.get('position') == '🛡️ Защитник']
-        goalkeepers = [p for p in club_players if p.get('position') == '🧤 Вратарь']
-        unknown = [p for p in club_players if p.get('position') == 'Не выбрана']
-        
-        text = f"🏟 КЛУБ: {club_found}\n\n"
+                club_players.append((uid, user))
+
+        rank = self.get_cis_rank(club_found)
+        text = f"<b><u>🏟 КЛУБ: {escape(club_found)}</u></b>\n\n"
         if owner:
-            text += f"👑 Владелец: {owner.get('roblox_nick')} (@{owner.get('username')})\n"
+            text += (
+                f"👑 Владелец: <b>{escape(str(owner.get('roblox_nick') or 'Не указан'))}</b> "
+                f"(@{escape(str(owner.get('username') or 'Нет username'))})\n"
+            )
         else:
-            text += f"👑 Владелец: Нет\n"
-        text += f"👥 Игроков: {len(club_players)}/{MAX_PLAYERS_PER_CLUB}\n\n"
-        
-        if forwards:
-            text += "⚽ НАПАДАЮЩИЕ:\n"
-            for p in forwards:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-            text += "\n"
-        
-        if midfielders:
-            text += "🔄 ПОЛУЗАЩИТНИКИ:\n"
-            for p in midfielders:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-            text += "\n"
-        
-        if defenders:
-            text += "🛡️ ЗАЩИТНИКИ:\n"
-            for p in defenders:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-            text += "\n"
-        
-        if goalkeepers:
-            text += "🧤 ВРАТАРИ:\n"
-            for p in goalkeepers:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-            text += "\n"
-        
-        if unknown:
-            text += "❓ БЕЗ ПОЗИЦИИ:\n"
-            for p in unknown:
-                text += f"  • {p.get('roblox_nick')} (@{p.get('username')})\n"
-        
-        if not club_players:
+            text += "👑 Владелец: <i>Нет</i>\n"
+        text += f"👥 Игроков: <code>{len(club_players)}/{MAX_PLAYERS_PER_CLUB}</code>\n"
+        text += f"🌍 ТОП СНГ: <b>#{rank}</b>\n\n" if rank else "🌍 ТОП СНГ: <i>не участвует</i>\n\n"
+        text += "<b>📋 СОСТАВ</b>\n"
+
+        if club_players:
+            club_players.sort(key=lambda item: (position_emoji(item[1].get('position')), str(item[1].get('roblox_nick', '')).casefold()))
+            for uid, player in club_players:
+                nation_name = player.get('nation')
+                flag = nation_premium_emoji(nation_name) if nation_name else "🏳️"
+                nick = escape(str(player.get('roblox_nick') or 'Не указан'))
+                text += f"{flag} | <b>{nick}</b> | {position_emoji(player.get('position'))}\n"
+        else:
             text += "📭 В клубе пока нет игроков\n"
-        
-        await update.message.reply_text(text)
+
+        markup = back_keyboard() if update.effective_chat.type == 'private' else None
+        await safe_send_message(context.bot, update.effective_chat.id, text, reply_markup=markup, parse_mode='HTML')
     
     async def profile_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Определяем тип вызова
@@ -1748,7 +3065,7 @@ class FootballBot:
                 f"{awards_text}\n"
                 f"╰────────────╯"
             )
-            await send_message(text, parse_mode='HTML')
+            await send_message(text, reply_markup=back_keyboard(), parse_mode='HTML')
             return
         
         # Свой профиль
@@ -1838,63 +3155,696 @@ class FootballBot:
             f"╰────────────╯"
             f"{search_club_status}{search_nation_status}\n📢 Объявлений о наборе в клуб сегодня: {today_club_used}/{RECRUITMENT_LIMIT_PER_DAY}\n📢 Объявлений о наборе в сборную сегодня: {today_nation_used}/{RECRUITMENT_LIMIT_PER_DAY}{premium_search_status}"
         )
-        await send_message(text, parse_mode='HTML')
+        await send_message(text, reply_markup=back_keyboard(), parse_mode='HTML')
     
     async def help_admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
-        
         if not is_admin(int(user_id)):
             await update.message.reply_text("❌ У вас нет прав администратора")
             return
-        
+
         help_text = (
-            "👨‍💼 КОМАНДЫ АДМИНИСТРАТОРА\n\n"
-            "/clubowner [id/ник] [клуб] - Назначить владельцем клуба\n"
-            "/removeowner [id/ник] [клуб] - Снять владельца клуба\n"
-            "/nationowner [id/ник] [сборная] - Назначить владельцем сборной\n"
-            "/removeownern [id/ник] [сборная] - Снять владельца сборной\n"
-            "/transfer_c [id/ник] [клуб] - Перевести игрока в клуб\n"
-            "/transfer_n [id/ник] [сборная] - Перевести игрока в сборную\n"
-            "/changenickname [id/ник] [новый ник] - Сменить ник\n"
-            "/post [текст] - Пост в канал\n"
-            "/post_bot [текст] - Рассылка\n"
-            "/ban [id] [срок] [причина] - Забанить\n"
-            "/unban [id/ник] - Разбанить\n"
-            "/player_end [id/ник] - Завершить карьеру\n"
-            "/player_noend [id/ник] - Вернуть карьеру\n"
-            "/add_admins [id/ник] - Добавить админа\n"
-            "/remove_admins [id/ник] - Удалить админа\n"
-            "/off_coldaun [id/ник] - Сбросить кулдауны\n"
-            "/premium [id/ник] - Выдать премиум\n"
-            "/list_premium - Список премиум\n"
-            "/give_tester [id/ник] - Выдать тестера\n"
-            "/give_goldenball [id/ник] - Золотой мяч\n"
-            "/give_goldenglove [id/ник] - Золотая перчатка\n"
-            "/give_ballancer [id/ник] - Балансер\n"
-            "/give_diamondwall [id/ник] - Алмазная стена\n"
-            "/give_goldmen [id/ник] - Голден бой\n"
-            "/give_goleador [id/ник] - Голлеадор\n"
-            "/give_sozdatel [id/ник] - Создатель\n"
-            "/give_opornik [id/ник] - Опорник\n"
-            "/remove_nagrada [id/ник] - Удалить все награды\n\n"
-            "❄️ ЗАМОРОЗКА:\n"
-            "/zamoroz_c [клуб] [причина] - Заморозить клуб\n"
-            "/razmoroz_c [клуб] - Разморозить клуб\n\n"
-            "📜 ИСТОРИЯ:\n"
-            "/history_player [id/ник] - История игрока\n"
-            "/history_club [название] - История клуба\n\n"
-            "/clubpanel - Панель клуба (ЛС)\n\n"
-            "📋 ОБЩИЕ КОМАНДЫ:\n"
-            "/clubs - Список клубов\n"
-            "/club [название] - Инфо о клубе\n"
-            "/nations - Список сборных\n"
-            "/nation [название] - Инфо о сборной\n"
-            "/profile [ник/id] - Профиль\n"
-            "/transfer_cl - Пригласить в клуб\n"
-            "/transfer_nt - Пригласить в сборную"
+            "<b>👨‍💼 КОМАНДЫ АДМИНИСТРАТОРА</b>\n\n"
+            "<code>/clubowner [id/ник] [клуб]</code> — назначить владельцем клуба\n"
+            "<code>/removeowner [id/ник] [клуб]</code> — снять владельца клуба\n"
+            "<code>/nationowner [id/ник] [сборная]</code> — назначить владельцем сборной\n"
+            "<code>/removeownern [id/ник] [сборная]</code> — снять владельца сборной\n"
+            "<code>/transfer_c [id/ник] [клуб]</code> — перевести игрока в клуб\n"
+            "<code>/transfer_n [id/ник] [сборная]</code> — перевести игрока в сборную\n"
+            "<code>/changenickname [id/ник] [новый ник]</code> — сменить ник\n"
+            "<code>/retire [id/ник]</code> — завершить карьеру\n"
+            "<code>/unretire [id/ник]</code> — вернуть карьеру\n"
+            "<code>/rename_c старое | новое</code> — переименовать клуб\n"
+            "<code>/rename_n старое | новое</code> — переименовать сборную\n"
+            "<code>/post [текст]</code> — пост в канал\n"
+            "<code>/post_bot [текст]</code> — рассылка\n"
+            "<code>/ban [id] [срок] [причина]</code> — забанить\n"
+            "<code>/unban [id/ник]</code> — разбанить\n"
+            "<code>/add_admins [id/ник]</code> — добавить администратора\n"
+            "<code>/remove_admins [id/ник]</code> — удалить администратора\n"
+            "<code>/off_coldaun [id/ник]</code> — сбросить кулдауны\n"
+            "<code>/premium [id/ник]</code> — выдать/снять премиум\n"
+            "<code>/list_premium</code> — список премиум-пользователей\n"
+            "<code>/give_tester [id/ник]</code> — выдать тестера\n\n"
+            "<b>🏆 НАГРАДЫ</b>\n"
+            "<code>/give_goldenball</code>, <code>/give_goldenglove</code>, <code>/give_ballancer</code>\n"
+            "<code>/give_diamondwall</code>, <code>/give_goldmen</code>, <code>/give_goleador</code>\n"
+            "<code>/give_sozdatel</code>, <code>/give_opornik</code>, <code>/remove_nagrada</code>\n\n"
+            "<b>❄️ ЗАМОРОЗКА</b>\n"
+            "<code>/zamoroz_c [клуб] [причина]</code>\n"
+            "<code>/razmoroz_c [клуб]</code>\n\n"
+            "<b>🏟 ОФИЦИАЛЬНЫЕ ЛИГИ</b>\n"
+            "<code>/update_league Лига 1 | Лига 2</code> — заменить список\n"
+            "<code>/add_league [название]</code> — добавить лигу\n"
+            "<code>/remove_league [название]</code> — удалить лигу\n"
+            "<code>/rename_league старое | новое</code> — переименовать лигу\n\n"
+            "<b>⚪️ НЕОФИЦИАЛЬНЫЕ ЛИГИ</b>\n"
+            "<code>/update_noofleague Лига 1 | Лига 2</code> — заменить список\n"
+            "<code>/add_noofleague [название]</code> — добавить лигу\n"
+            "<code>/remove_noofleague [название]</code> — удалить лигу\n"
+            "<code>/rename_noofleague старое | новое</code> — переименовать лигу\n\n"
+            "<b>📨 ЗАЯВКИ</b>\n"
+            "<code>/open_application</code> — открыть заявки\n"
+            "<code>/close_application</code> — закрыть заявки\n\n"
+            "<b>🌍 ТОП СНГ</b>\n"
+            "<code>/match Победитель +1 Проигравший [тех]</code> — добавить официальный матч\n"
+            "<code>/set_top_cis Клуб | место</code> — поставить клуб на место\n"
+            "<code>/swap_top_cis Клуб 1 | Клуб 2</code> — поменять клубы местами\n"
+            "<code>/reset_top_cis</code> — новый сезон со случайным порядком\n"
+            "<code>/top_streaks</code> — активные страйки\n\n"
+            "<b>📜 ИСТОРИЯ</b>\n"
+            "<code>/history</code> — личная история клубов по месяцам\n"
+            "<code>/history_player [id/ник]</code>\n"
+            "<code>/history_club [название]</code>\n\n"
+            "<b>📋 ОБЩИЕ</b>\n"
+            "<code>/help</code>, <code>/moders</code>, <code>/official_league</code>, <code>/clubs</code>, <code>/nations</code>, <code>/top_cis</code>"
         )
-        await update.message.reply_text(help_text)
-    
+        await update.message.reply_text(help_text, reply_markup=back_keyboard('admin'), parse_mode='HTML')
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = (
+            "<b><u>ℹ️ ПОМОЩЬ ПО БОТУ</u></b>\n\n"
+            "<i>Transfer Markt | Touch Football</i>\n\n"
+            "<b>🧭 ОСНОВНЫЕ РАЗДЕЛЫ</b>\n"
+            "🔍 <b>Ищу клуб/сборную</b> — поиск новой команды\n"
+            "👤 <b>Профиль</b> — данные игрока, карьера и статус\n"
+            "⚙️ <b>Настройки</b> — ник, позиция и уведомления\n"
+            "📢 <b>Объявление</b> — отправка объявления\n"
+            "🥀 <b>Завершить карьеру</b> — пауза на 30 дней\n"
+            "🆘 <b>Техподдержка</b> — обращение к администрации\n"
+            "⭐ <b>Донат</b> — покупки через Telegram Stars\n"
+            "🌍 <b>ТОП СНГ</b> — автоматический рейтинг клубов\n\n"
+            "<b><u>👑 ЧТО ДАЁТ ПРЕМИУМ</u></b>\n"
+            "• Кулдаун поиска клуба и сборной — <code>1 час</code>\n"
+            "• До <code>3 поисков</code> в день\n"
+            "• Просмотр <code>ТОП-15 СНГ</code> вместо ТОП-10\n"
+            "• Уведомления о матчах и страйках ТОП СНГ\n"
+            "• Видно, какой модератор обработал заявку\n"
+            "• Покупка премиума — <code>75 ⭐</code>\n\n"
+            "<b><u>📋 КОМАНДЫ ИГРОКА</u></b>\n"
+            "<code>/start</code> — открыть главное меню\n"
+            "<code>/help</code> — открыть помощь\n"
+            "<code>/history</code> — ваша история клубов по месяцам\n"
+            "<code>/moders</code> — список модераторов\n"
+            "<code>/support_moder @Username причина</code> — жалоба на модератора\n"
+            "<code>/official_league</code> — официальные лиги\n"
+            "<code>/noofficial_league</code> — неофициальные лиги\n"
+            "<code>/clubs</code> — реестр клубов\n"
+            "<code>/nations</code> — реестр сборных\n"
+            "<code>/club [название]</code> — информация о клубе\n"
+            "<code>/nation [название]</code> — информация о сборной\n"
+            "<code>/top_cis</code> — посмотреть ТОП СНГ\n"
+            "<code>/profile [ник/id]</code> — профиль игрока\n"
+            "<code>/donate</code> — открыть донат\n"
+            "<code>/transfer_cl</code> — пригласить игрока в клуб\n"
+            "<code>/transfer_nt</code> — пригласить игрока в сборную\n\n"
+            f"<b><u>📌 ПРАВИЛО СБОРНЫХ</u></b>\n"
+            f"В одной сборной может быть максимум <code>{MAX_SAME_CLUB_PER_NATION}</code> игрока из одного клуба."
+        )
+        keyboard = back_keyboard() if update.effective_chat.type == "private" else None
+        await self._reply_or_edit(update, text, reply_markup=keyboard, parse_mode='HTML')
+
+    async def moders_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        admins = normalize_admin_ids(load_data(ADMINS_FILE, {"admins": []}).get("admins", []))
+        now_ts = int(time.time())
+        online_count = 0
+        offline_count = 0
+        lines = ["<b><u>👑 Список администраторов</u></b>", ""]
+
+        for admin_id in admins:
+            user = self.users.get(str(admin_id), {})
+            nick = escape(str(user.get("roblox_nick") or "Не указан"))
+            username = escape(str(user.get("username") or "Нет username"))
+            activity_ts = user.get("last_activity_ts")
+            if not activity_ts and user.get("last_seen"):
+                try:
+                    activity_ts = int(datetime.fromisoformat(user["last_seen"]).timestamp())
+                except (TypeError, ValueError):
+                    activity_ts = 0
+            try:
+                seconds_ago = max(0, now_ts - int(activity_ts or 0))
+            except (TypeError, ValueError):
+                seconds_ago = 10**9
+            is_online_now = seconds_ago <= MODERATOR_ONLINE_MINUTES * 60
+
+            if is_online_now:
+                status = "✅ <b>Онлайн</b>"
+                online_count += 1
+            else:
+                status = "⛔️ <b>Офлайн</b>"
+                offline_count += 1
+            username_text = f"<i>@{username}</i>" if username != "Нет username" else f"<i>{username}</i>"
+            lines.append(f"• <b>{nick}</b> | {username_text} — {status}")
+
+        lines.extend([
+            "",
+            f"✅ Онлайн: <code>{online_count}</code>",
+            f"⛔️ Офлайн: <code>{offline_count}</code>",
+            "",
+            f"<i>Статус показывает активность внутри бота за последние {MODERATOR_ONLINE_MINUTES} минут.</i>",
+        ])
+        await self._reply_or_edit(update, "\n".join(lines), reply_markup=back_keyboard(), parse_mode='HTML')
+
+    async def rename_club_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._rename_registry_entity(update, context, "club")
+
+    async def rename_nation_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._rename_registry_entity(update, context, "nation")
+
+    async def _rename_registry_entity(self, update: Update, context: ContextTypes.DEFAULT_TYPE, entity_type):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        raw = " ".join(context.args).strip()
+        if "|" not in raw:
+            command = "/rename_c" if entity_type == "club" else "/rename_n"
+            await update.message.reply_text(f"❌ Использование: {command} Старое название | Новое название")
+            return
+        old_input, new_input = [part.strip() for part in raw.split("|", 1)]
+        registry = CLUBS_STRUCTURE if entity_type == "club" else NATIONS_STRUCTURE
+        old_name = find_case_insensitive(registry, old_input)
+        if not old_name:
+            await update.message.reply_text("❌ Старое название не найдено в реестре.")
+            return
+        valid, result = validate_registry_name(new_input)
+        if not valid:
+            await update.message.reply_text(f"❌ {result}")
+            return
+        new_name = result
+        existing = find_case_insensitive(registry, new_name)
+        if existing and existing != old_name:
+            await update.message.reply_text("❌ Такое название уже существует.")
+            return
+        index = registry.index(old_name)
+        registry[index] = new_name
+        self._rename_entity_references(old_name, new_name)
+        self._save_registry()
+        entity_word = "Клуб" if entity_type == "club" else "Сборная"
+        await update.message.reply_text(
+            f"✅ {entity_word} переименован:\n\n<code>{escape(old_name)}</code> → <code>{escape(new_name)}</code>",
+            parse_mode='HTML'
+        )
+
+    async def official_league_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        leagues = self.leagues.get("leagues", [])
+        if leagues:
+            body = "\n".join(f"• <i>{escape(str(name))}</i>" for name in leagues)
+        else:
+            body = "<i>Список официальных лиг пока пуст.</i>"
+        await self._reply_or_edit(
+            update,
+            f"<b><u>🏟 ОФИЦИАЛЬНЫЕ ЛИГИ</u></b>\n\n{body}",
+            reply_markup=back_keyboard(),
+            parse_mode='HTML'
+        )
+
+    async def add_league_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        name = " ".join(context.args).strip()
+        valid, result = validate_registry_name(name)
+        if not valid:
+            await update.message.reply_text(f"❌ Использование: /add_league [название]\n{result}")
+            return
+        name = result
+        leagues = self.leagues.setdefault("leagues", [])
+        if find_case_insensitive(leagues, name):
+            await update.message.reply_text("❌ Такая лига уже есть в списке.")
+            return
+        leagues.append(name)
+        save_data(LEAGUES_FILE, self.leagues)
+        await update.message.reply_text(f"✅ Лига <b>{escape(name)}</b> добавлена.", reply_markup=back_keyboard("admin"), parse_mode='HTML')
+
+    async def remove_league_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        name = " ".join(context.args).strip()
+        found = find_case_insensitive(self.leagues.get("leagues", []), name)
+        if not found:
+            await update.message.reply_text("❌ Лига не найдена.")
+            return
+        self.leagues["leagues"].remove(found)
+        save_data(LEAGUES_FILE, self.leagues)
+        await update.message.reply_text(f"✅ Лига <b>{escape(found)}</b> удалена.", reply_markup=back_keyboard("admin"), parse_mode='HTML')
+
+    async def rename_league_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        raw = " ".join(context.args).strip()
+        if "|" not in raw:
+            await update.message.reply_text("❌ Использование: /rename_league Старое название | Новое название")
+            return
+        old_input, new_input = [part.strip() for part in raw.split("|", 1)]
+        leagues = self.leagues.setdefault("leagues", [])
+        old_name = find_case_insensitive(leagues, old_input)
+        if not old_name:
+            await update.message.reply_text("❌ Старая лига не найдена.")
+            return
+        valid, result = validate_registry_name(new_input)
+        if not valid:
+            await update.message.reply_text(f"❌ {result}")
+            return
+        new_name = result
+        existing = find_case_insensitive(leagues, new_name)
+        if existing and existing != old_name:
+            await update.message.reply_text("❌ Такая лига уже существует.")
+            return
+        leagues[leagues.index(old_name)] = new_name
+        save_data(LEAGUES_FILE, self.leagues)
+        await update.message.reply_text(
+            f"✅ Лига переименована:\n<code>{escape(old_name)}</code> → <code>{escape(new_name)}</code>",
+            parse_mode='HTML'
+        )
+
+    async def update_league_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора")
+            return
+        raw = " ".join(context.args).strip()
+        if not raw:
+            self.leagues = load_data(LEAGUES_FILE, {"leagues": []})
+            await update.message.reply_text("✅ Список лиг перечитан из файла.")
+            return
+        candidates = [" ".join(item.strip().split()) for item in raw.split("|") if item.strip()]
+        cleaned = []
+        for candidate in candidates:
+            valid, result = validate_registry_name(candidate)
+            if not valid:
+                await update.message.reply_text(f"❌ Некорректная лига «{candidate}»: {result}")
+                return
+            if not find_case_insensitive(cleaned, result):
+                cleaned.append(result)
+        self.leagues = {"leagues": cleaned}
+        save_data(LEAGUES_FILE, self.leagues)
+        await update.message.reply_text(f"<b>✅ Список официальных лиг обновлён.</b> Всего: <code>{len(cleaned)}</code>", reply_markup=back_keyboard("admin"), parse_mode='HTML')
+
+    async def noofficial_league_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        leagues = self.noofficial_leagues.get("leagues", [])
+        if leagues:
+            body = "\n".join(f"• <i>{escape(str(name))}</i>" for name in leagues)
+        else:
+            body = "<i>Список неофициальных лиг пока пуст.</i>"
+        await self._reply_or_edit(
+            update,
+            f"<b><u>⚪️ НЕОФИЦИАЛЬНЫЕ ЛИГИ</u></b>\n\n{body}",
+            reply_markup=back_keyboard(),
+            parse_mode='HTML'
+        )
+
+    async def add_noofleague_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора", reply_markup=back_keyboard())
+            return
+        name = " ".join(context.args).strip()
+        valid, result = validate_registry_name(name)
+        if not valid:
+            await update.message.reply_text(
+                f"<b>❌ Использование:</b> <code>/add_noofleague [название]</code>\n<i>{escape(result)}</i>",
+                reply_markup=back_keyboard("admin"), parse_mode='HTML'
+            )
+            return
+        name = result
+        leagues = self.noofficial_leagues.setdefault("leagues", [])
+        if find_case_insensitive(leagues, name):
+            await update.message.reply_text("❌ Такая лига уже есть в списке.", reply_markup=back_keyboard("admin"))
+            return
+        leagues.append(name)
+        save_data(NOOFFICIAL_LEAGUES_FILE, self.noofficial_leagues)
+        await update.message.reply_text(
+            f"✅ Неофициальная лига <b>{escape(name)}</b> добавлена.",
+            reply_markup=back_keyboard("admin"), parse_mode='HTML'
+        )
+
+    async def remove_noofleague_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора", reply_markup=back_keyboard())
+            return
+        name = " ".join(context.args).strip()
+        found = find_case_insensitive(self.noofficial_leagues.get("leagues", []), name)
+        if not found:
+            await update.message.reply_text("❌ Лига не найдена.", reply_markup=back_keyboard("admin"))
+            return
+        self.noofficial_leagues["leagues"].remove(found)
+        save_data(NOOFFICIAL_LEAGUES_FILE, self.noofficial_leagues)
+        await update.message.reply_text(
+            f"✅ Неофициальная лига <b>{escape(found)}</b> удалена.",
+            reply_markup=back_keyboard("admin"), parse_mode='HTML'
+        )
+
+    async def rename_noofleague_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора", reply_markup=back_keyboard())
+            return
+        raw = " ".join(context.args).strip()
+        if "|" not in raw:
+            await update.message.reply_text(
+                "<b>❌ Использование:</b> <code>/rename_noofleague Старое название | Новое название</code>",
+                reply_markup=back_keyboard("admin"), parse_mode='HTML'
+            )
+            return
+        old_input, new_input = [part.strip() for part in raw.split("|", 1)]
+        leagues = self.noofficial_leagues.setdefault("leagues", [])
+        old_name = find_case_insensitive(leagues, old_input)
+        if not old_name:
+            await update.message.reply_text("❌ Старая лига не найдена.", reply_markup=back_keyboard("admin"))
+            return
+        valid, result = validate_registry_name(new_input)
+        if not valid:
+            await update.message.reply_text(f"❌ {escape(result)}", reply_markup=back_keyboard("admin"), parse_mode='HTML')
+            return
+        new_name = result
+        existing = find_case_insensitive(leagues, new_name)
+        if existing and existing != old_name:
+            await update.message.reply_text("❌ Такая лига уже существует.", reply_markup=back_keyboard("admin"))
+            return
+        leagues[leagues.index(old_name)] = new_name
+        save_data(NOOFFICIAL_LEAGUES_FILE, self.noofficial_leagues)
+        await update.message.reply_text(
+            f"<b>✅ Неофициальная лига переименована:</b>\n<code>{escape(old_name)}</code> → <code>{escape(new_name)}</code>",
+            reply_markup=back_keyboard("admin"), parse_mode='HTML'
+        )
+
+    async def update_noofleague_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора", reply_markup=back_keyboard())
+            return
+        raw = " ".join(context.args).strip()
+        if not raw:
+            self.noofficial_leagues = load_data(NOOFFICIAL_LEAGUES_FILE, {"leagues": []})
+            await update.message.reply_text("✅ Список неофициальных лиг перечитан из файла.", reply_markup=back_keyboard("admin"))
+            return
+        candidates = [" ".join(item.strip().split()) for item in raw.split("|") if item.strip()]
+        cleaned = []
+        for candidate in candidates:
+            valid, result = validate_registry_name(candidate)
+            if not valid:
+                await update.message.reply_text(
+                    f"❌ Некорректная лига <code>{escape(candidate)}</code>: <i>{escape(result)}</i>",
+                    reply_markup=back_keyboard("admin"), parse_mode='HTML'
+                )
+                return
+            if not find_case_insensitive(cleaned, result):
+                cleaned.append(result)
+        self.noofficial_leagues = {"leagues": cleaned}
+        save_data(NOOFFICIAL_LEAGUES_FILE, self.noofficial_leagues)
+        await update.message.reply_text(
+            f"<b>✅ Список неофициальных лиг обновлён.</b> Всего: <code>{len(cleaned)}</code>",
+            reply_markup=back_keyboard("admin"), parse_mode='HTML'
+        )
+
+    async def support_moder_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        if is_banned(int(user_id)):
+            await update.message.reply_text("❌ Вы забанены в боте.")
+            return
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ Использование: /support_moder @Username Причина")
+            return
+        target_username = normalize_username(context.args[0])
+        reason = " ".join(context.args[1:]).strip()
+        admins = normalize_admin_ids(load_data(ADMINS_FILE, {"admins": []}).get("admins", []))
+        target_id = None
+        target_user = None
+        for admin_id in admins:
+            candidate = self.users.get(str(admin_id), {})
+            if normalize_username(candidate.get("username")) == target_username:
+                target_id = str(admin_id)
+                target_user = candidate
+                break
+        if not target_user:
+            await update.message.reply_text("❌ Модератор с таким @Username не найден.")
+            return
+        if target_id == user_id:
+            await update.message.reply_text("❌ Нельзя отправить жалобу на самого себя.")
+            return
+
+        complaint_id = new_request_id(self.moder_complaints)
+        player = self.users.get(user_id, {})
+        complaint = {
+            "id": complaint_id,
+            "user_id": user_id,
+            "user_username": update.effective_user.username,
+            "user_nick": player.get("roblox_nick", "Не указан"),
+            "moder_id": target_id,
+            "moder_username": target_user.get("username"),
+            "reason": reason,
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+        }
+        self.moder_complaints[complaint_id] = complaint
+        save_data(MODER_COMPLAINTS_FILE, self.moder_complaints)
+
+        creator_text = (
+            f"<b>Жалоба на модератора @{escape(str(target_user.get('username') or 'Нет username'))}❗️</b>\n\n"
+            f"<b>Причина:</b> {escape(reason)}"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Ответить", callback_data=f"moder_reply_{complaint_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"moder_reject_{complaint_id}"),
+            InlineKeyboardButton("💤 Игнорировать", callback_data=f"moder_ignore_{complaint_id}")
+        ]])
+        try:
+            sent = await context.bot.send_message(
+                chat_id=CREATOR_ID,
+                text=creator_text,
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+            complaint["creator_chat_id"] = sent.chat_id
+            complaint["creator_message_id"] = sent.message_id
+            complaint["creator_text"] = creator_text
+            save_data(MODER_COMPLAINTS_FILE, self.moder_complaints)
+        except Exception as exc:
+            logger.error(f"Не удалось отправить жалобу создателю: {exc}")
+            await update.message.reply_text("❌ Не удалось отправить жалобу создателю.")
+            return
+
+        complainant_username = escape(str(update.effective_user.username or "Нет username"))
+        player_nick = escape(str(player.get("roblox_nick", "Не указан")))
+        accused_text = (
+            "<b>На вас пожаловался игрок проекта Transfer Markt❗️</b>\n\n"
+            f"<code>{player_nick}</code> | @{complainant_username}\n\n"
+            f"<b>Причина жалобы:</b> {escape(reason)}\n\n"
+            "Скоро с вами свяжется создатель чтобы обговорить ситуацию ожидайте ⚠️"
+        )
+        try:
+            await context.bot.send_message(chat_id=int(target_id), text=accused_text, parse_mode='HTML')
+        except Exception as exc:
+            logger.error(f"Не удалось уведомить модератора о жалобе: {exc}")
+
+        await update.message.reply_text("✅ Жалоба отправлена создателю бота.")
+
+    async def handle_moder_complaint_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if query.from_user.id != CREATOR_ID:
+            await query.answer("❌ Только создатель может обработать жалобу.", show_alert=True)
+            return
+        parts = query.data.split("_", 2)
+        if len(parts) != 3:
+            await query.edit_message_text("❌ Некорректная заявка.")
+            return
+        action = parts[1]
+        complaint_id = parts[2]
+        complaint = self.moder_complaints.get(complaint_id)
+        if not complaint:
+            await query.edit_message_text("❌ Жалоба не найдена.")
+            return
+        if complaint.get("status") != "pending":
+            await query.answer("Эта жалоба уже обработана.", show_alert=True)
+            return
+        await query.answer()
+        if action == "reply":
+            context.user_data["waiting_for"] = "moder_complaint_reply"
+            context.user_data["moder_complaint_id"] = complaint_id
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("✍️ Введите ответ игроку по этой жалобе:")
+            return
+        if action == "reject":
+            complaint["status"] = "rejected"
+            complaint["processed_at"] = datetime.now().isoformat()
+            save_data(MODER_COMPLAINTS_FILE, self.moder_complaints)
+            await query.edit_message_text(f"{query.message.text}\n\n❌ ОТКЛОНЕНО")
+            try:
+                await context.bot.send_message(chat_id=int(complaint["user_id"]), text="❌ Ваша жалоба на модератора отклонена создателем.")
+            except Exception as exc:
+                logger.error(f"Ошибка уведомления по жалобе: {exc}")
+            return
+        complaint["status"] = "ignored"
+        complaint["processed_at"] = datetime.now().isoformat()
+        save_data(MODER_COMPLAINTS_FILE, self.moder_complaints)
+        await query.edit_message_text(f"{query.message.text}\n\n💤 ПРОИГНОРИРОВАНО")
+
+    async def donate_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.show_donate_menu(update, context)
+
+    async def show_donate_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.effective_user.id)
+        banned = is_banned(int(user_id))
+        buttons = []
+        if not banned:
+            career_active = self.users.get(user_id, {}).get("career_active", True)
+            restore_text = "🔒 Вернуть карьеру — 50 ⭐" if not career_active else "Вернуть карьеру — 50 ⭐"
+            buttons.extend([
+                InlineKeyboardButton(restore_text, callback_data="donate_restore"),
+                InlineKeyboardButton("Снять кд — 15 ⭐", callback_data="donate_cooldown"),
+            ])
+        buttons.append(InlineKeyboardButton("Купить разбан — 50 ⭐", callback_data="donate_unban"))
+        premium_text = "👑 Премиум уже активен" if is_premium(int(user_id)) else "Купить премиум — 75 ⭐"
+        buttons.append(InlineKeyboardButton(premium_text, callback_data="donate_premium"))
+        buttons.append(InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"))
+        await self._reply_or_edit(
+            update,
+            "<b><u>⭐ ДОНАТ</u></b>\n\n"
+            "<i>Выберите нужную услугу.</i>\n"
+            "Оплата проходит через <b>Telegram Stars</b>.\n\n"
+            "<code>50 ⭐</code> — вернуть карьеру или купить разбан\n"
+            "<code>15 ⭐</code> — снять все кулдауны\n"
+            "<code>75 ⭐</code> — получить премиум",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons)),
+            parse_mode='HTML'
+        )
+
+    async def create_donation_invoice(self, update: Update, context: ContextTypes.DEFAULT_TYPE, action):
+        user_id = str(update.effective_user.id)
+        user = self.users.get(user_id, {})
+        if action == "restore" and user.get("career_active", True):
+            await update.callback_query.answer("Ваша карьера уже активна.", show_alert=True)
+            return
+        if action == "unban" and not is_banned(int(user_id)):
+            await update.callback_query.answer("Вы не забанены.", show_alert=True)
+            return
+        if action == "premium" and is_premium(int(user_id)):
+            await update.callback_query.answer("У вас уже активен премиум.", show_alert=True)
+            return
+        if action not in DONATE_PRICES:
+            await update.callback_query.answer("Неизвестная покупка.", show_alert=True)
+            return
+        titles = {
+            "restore": ("Вернуть карьеру", "Мгновенное восстановление карьеры"),
+            "cooldown": ("Снять кд", "Сброс всех игровых кулдаунов"),
+            "unban": ("Купить разбан", "Мгновенный разбан в боте"),
+            "premium": ("Купить премиум", "Активация премиум-возможностей бота"),
+        }
+        title, description = titles[action]
+        payload = f"tm_donate:{action}:{user_id}:{uuid.uuid4().hex[:8]}"
+        await update.callback_query.answer()
+        await context.bot.send_invoice(
+            chat_id=int(user_id),
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(title, DONATE_PRICES[action])]
+        )
+
+    async def precheckout_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.pre_checkout_query
+        data = normalize_payment_payload(query.invoice_payload)
+        if not data:
+            await query.answer(ok=False, error_message="Некорректный платёж.")
+            return
+        expected = DONATE_PRICES.get(data["action"])
+        if data["user_id"] != str(query.from_user.id) or expected != query.total_amount or query.currency != "XTR":
+            await query.answer(ok=False, error_message="Параметры платежа не совпадают.")
+            return
+        user_id = str(query.from_user.id)
+        if data["action"] == "restore" and self.users.get(user_id, {}).get("career_active", True):
+            await query.answer(ok=False, error_message="Ваша карьера уже активна.")
+            return
+        if data["action"] == "unban" and not is_banned(int(user_id)):
+            await query.answer(ok=False, error_message="Вы уже не забанены.")
+            return
+        if data["action"] == "premium" and is_premium(int(user_id)):
+            await query.answer(ok=False, error_message="У вас уже активен премиум.")
+            return
+        await query.answer(ok=True)
+
+    async def successful_payment_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        payment = update.message.successful_payment
+        data = normalize_payment_payload(payment.invoice_payload)
+        if not data:
+            logger.error("Получен успешный платеж с неизвестным payload")
+            return
+        user_id = str(update.effective_user.id)
+        charge_id = payment.telegram_payment_charge_id
+        processed = self.payments.setdefault("processed", {})
+        if charge_id in processed:
+            await update.message.reply_text("✅ Этот платёж уже был обработан.")
+            return
+        expected = DONATE_PRICES.get(data["action"])
+        if data["user_id"] != user_id or expected != payment.total_amount or payment.currency != "XTR":
+            logger.error("Параметры успешного платежа не прошли проверку")
+            return
+
+        ensure_user_record(self.users, user_id, update.effective_user.username, update.effective_user.first_name)
+        action = data["action"]
+        if action == "restore":
+            self.users[user_id]["career_active"] = True
+            self.users[user_id]["career_end_date"] = None
+            self.users[user_id]["club"] = None
+            self.users[user_id]["nation"] = None
+            result_text = "Карьера успешно восстановлена. Теперь вы свободный агент."
+        elif action == "cooldown":
+            self.reset_all_transfer_cd(user_id)
+            result_text = "Все кулдауны успешно сброшены."
+        elif action == "unban":
+            self.bans = load_data(BANS_FILE, {"banned": [], "ban_info": {}})
+            self.bans["banned"] = [value for value in self.bans.get("banned", []) if str(value) != user_id]
+            self.bans.setdefault("ban_info", {}).pop(user_id, None)
+            save_data(BANS_FILE, self.bans)
+            result_text = "Разбан успешно куплен. Вы снова можете пользоваться ботом."
+        elif action == "premium":
+            premium_users = load_data(PREMIUM_USERS_FILE, {"premium": []})
+            premium_ids = [str(value) for value in premium_users.get("premium", [])]
+            if user_id not in premium_ids:
+                premium_ids.append(user_id)
+            premium_users["premium"] = premium_ids
+            save_data(PREMIUM_USERS_FILE, premium_users)
+            self.premium_users = premium_users
+            result_text = "Премиум успешно активирован. Все премиум-возможности уже доступны."
+        else:
+            logger.error(f"Неизвестное действие успешного платежа: {action}")
+            return
+
+        save_data(USERS_FILE, self.users)
+        processed[charge_id] = {
+            "user_id": user_id,
+            "action": action,
+            "amount": payment.total_amount,
+            "currency": payment.currency,
+            "processed_at": datetime.now().isoformat(),
+        }
+        save_data(PAYMENTS_FILE, self.payments)
+
+        donation_labels = {
+            "restore": "Вернуть карьеру",
+            "cooldown": "Снятие кд",
+            "unban": "Разбан",
+            "premium": "Премиум",
+        }
+        player = self.users.get(user_id, {})
+        player_nick = escape(str(player.get("roblox_nick") or "Не указан"))
+        username = escape(str(update.effective_user.username or player.get("username") or "Нет username"))
+        username_text = f"@{username}" if username != "Нет username" else username
+        admin_text = (
+            "<b><u>⭐️ КУПИЛ ДОНАТ ⭐️</u></b>\n\n"
+            f"<b>Игрок:</b> <code>{player_nick}</code> | <i>{username_text}</i>\n"
+            f"<b>Вид:</b> {escape(donation_labels.get(action, action))}"
+        )
+        await send_to_admin_group(context.bot, admin_text)
+        await update.message.reply_text(
+            "<b><u>✅ ПОКУПКА УСПЕШНА</u></b>\n\n"
+            f"<b>Услуга:</b> <code>{escape(donation_labels.get(action, action))}</code>\n"
+            f"<b>Стоимость:</b> <code>{payment.total_amount} ⭐</code>\n\n"
+            f"<i>{escape(result_text)}</i>",
+            reply_markup=back_keyboard(),
+            parse_mode='HTML'
+        )
+
     async def show_admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = str(query.from_user.id)
@@ -1921,17 +3871,23 @@ class FootballBot:
         
         announcements_status = "🔓 ОТКРЫТЫ" if are_announcements_open() else "🔒 ЗАКРЫТЫ"
         
-        text = f"🚫 АДМИН ПАНЕЛЬ\n\n📢 Объявления: {announcements_status}\n👥 Пользователей: {len(self.users)}\n🥀 Завершенные карьеры: {len(ended_careers)}\n❌ Забаненые пользователи: {len(banned_users)}"
+        text = (
+            "<b><u>🚫 АДМИН ПАНЕЛЬ</u></b>\n\n"
+            f"📢 <b>Заявки:</b> {announcements_status}\n"
+            f"👥 <b>Пользователей:</b> <code>{len(self.users)}</code>\n"
+            f"🥀 <b>Завершённые карьеры:</b> <code>{len(ended_careers)}</code>\n"
+            f"❌ <b>Заблокировано:</b> <code>{len(banned_users)}</code>"
+        )
         
-        keyboard = [
-            [InlineKeyboardButton("❌ Закрыть объявления", callback_data="close_announcements"),
-             InlineKeyboardButton("✅ Открыть объявления", callback_data="open_announcements")],
-            [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
-            [InlineKeyboardButton("🥀 Завершенные карьеры", callback_data="ended_careers_list")],
-            [InlineKeyboardButton("❌ Забаненые пользователи", callback_data="banned_users_list")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]
+        buttons = [
+            InlineKeyboardButton("❌ Закрыть объявления", callback_data="close_announcements"),
+            InlineKeyboardButton("✅ Открыть объявления", callback_data="open_announcements"),
+            InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"),
+            InlineKeyboardButton("🥀 Завершенные карьеры", callback_data="ended_careers_list"),
+            InlineKeyboardButton("❌ Забаненые пользователи", callback_data="banned_users_list"),
+            InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"),
         ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons)), parse_mode='HTML')
     
     async def close_announcements(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -1957,6 +3913,28 @@ class FootballBot:
         await query.answer("✅ Объявления открыты! Заявки будут приниматься.", show_alert=True)
         await self.show_admin_panel(update, context)
     
+    async def open_application_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора", reply_markup=back_keyboard())
+            return
+        set_announcements_open(True)
+        await update.message.reply_text(
+            "<b>✅ ЗАЯВКИ ОТКРЫТЫ</b>\n\n<i>Пользователи снова могут отправлять заявки и объявления.</i>",
+            reply_markup=back_keyboard("admin"),
+            parse_mode='HTML'
+        )
+
+    async def close_application_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ У вас нет прав администратора", reply_markup=back_keyboard())
+            return
+        set_announcements_open(False)
+        await update.message.reply_text(
+            "<b>🔒 ЗАЯВКИ ЗАКРЫТЫ</b>\n\n<i>Новые заявки и объявления временно не принимаются.</i>",
+            reply_markup=back_keyboard("admin"),
+            parse_mode='HTML'
+        )
+
     async def club_panel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type != 'private':
             await update.message.reply_text("❌ Эта команда работает только в личных сообщениях с ботом!")
@@ -1978,22 +3956,123 @@ class FootballBot:
         await self.show_club_panel(update, context, club_name)
     
     async def show_club_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, club_name):
-        keyboard = [
-            [InlineKeyboardButton("📋 Состав клуба", callback_data=f"clubpanel_squad_{club_name}")],
-            [InlineKeyboardButton("📜 История трансферов", callback_data=f"clubpanel_transfers_{club_name}")],
-            [InlineKeyboardButton("👑 Пригласить игрока", callback_data=f"clubpanel_invite_{club_name}")],
-            [InlineKeyboardButton("🚪 Выгнать игрока", callback_data=f"clubpanel_kick_{club_name}")],
-            [InlineKeyboardButton("👑 Смена владельца", callback_data=f"change_owner_club_{club_name}")],
-            [InlineKeyboardButton("🔍 Поиск товарняка", callback_data=f"match_search_club_{club_name}")],
-            [InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")]
+        buttons = [
+            InlineKeyboardButton("📋 Состав клуба", callback_data=f"clubpanel_squad_{club_name}"),
+            InlineKeyboardButton("📜 История трансферов", callback_data=f"clubpanel_transfers_{club_name}"),
+            InlineKeyboardButton("👑 Пригласить игрока", callback_data=f"clubpanel_invite_{club_name}"),
+            InlineKeyboardButton("🚪 Выгнать игрока", callback_data=f"clubpanel_kick_{club_name}"),
+            InlineKeyboardButton("👑 Смена владельца", callback_data=f"change_owner_club_{club_name}"),
+            InlineKeyboardButton("🔍 Поиск товарняка", callback_data=f"match_search_club_{club_name}"),
+            InlineKeyboardButton("❌ Закрыть клуб", callback_data=f"close_club_confirm_{club_name}"),
+            InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu"),
         ]
         
         text = f"👑 ПАНЕЛЬ УПРАВЛЕНИЯ: {club_name}\n\n📋 Лиги идущие на золотой мяч: https://t.me/TouchFootTransMarkt/24\n\nВыберите действие:"
+        markup = InlineKeyboardMarkup(two_column_keyboard(buttons))
         
         if update.callback_query:
-            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await update.callback_query.edit_message_text(text, reply_markup=markup)
         else:
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await update.message.reply_text(text, reply_markup=markup)
+
+    async def close_club_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE, club_name):
+        query = update.callback_query
+        user_id = str(query.from_user.id)
+        user = self.users.get(user_id, {})
+
+        if user.get('club_owner') != club_name:
+            await query.edit_message_text("❌ Вы не являетесь владельцем этого клуба!")
+            return
+
+        buttons = [
+            InlineKeyboardButton("✅ Да, закрыть", callback_data=f"close_club_yes_{club_name}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"club_back_{club_name}"),
+        ]
+        await query.edit_message_text(
+            f"❌ ЗАКРЫТИЕ КЛУБА {club_name}\n\n"
+            "⚠️ Все игроки клуба станут свободными агентами, а вы потеряете права владельца.\n\n"
+            "Вы уверены, что хотите закрыть клуб?",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons))
+        )
+
+    async def close_club(self, update: Update, context: ContextTypes.DEFAULT_TYPE, club_name):
+        query = update.callback_query
+        owner_id = str(query.from_user.id)
+        owner = self.users.get(owner_id, {})
+
+        if owner.get('club_owner') != club_name:
+            await query.edit_message_text("❌ Вы не являетесь владельцем этого клуба!")
+            return
+
+        closed_at = datetime.now().isoformat()
+        released_players = []
+
+        for uid, player in self.users.items():
+            if player.get('club') == club_name:
+                released_players.append((uid, player.get('roblox_nick', 'Не указан')))
+                player['last_club'] = club_name
+                player['club'] = None
+                player['last_transfer_club_date'] = None
+                self.history.setdefault('transfers', []).append({
+                    "user_id": str(uid),
+                    "player": player.get('roblox_nick', 'Не указан'),
+                    "from_club": club_name,
+                    "to_club": "Свободный агент",
+                    "transfer_type": "club",
+                    "timestamp": closed_at,
+                    "admin": owner_id,
+                    "position": player.get('position', 'Не указана')
+                })
+            if player.get('club_owner') == club_name:
+                player['club_owner'] = None
+
+        # Если клуб был заморожен, удаляем запись, чтобы он не восстановился автоматически.
+        if club_name in self.frozen_clubs:
+            del self.frozen_clubs[club_name]
+            save_data(FROZEN_CLUBS_FILE, self.frozen_clubs)
+
+        save_data(USERS_FILE, self.users)
+        save_data(HISTORY_FILE, self.history)
+
+        top_change = self.move_cis_club_to_bottom(club_name)
+        if top_change:
+            top_notice = (
+                f"<b>🌍 ТОП СНГ ИЗМЕНЁН</b>\n\n"
+                f"❌ Клуб {escape(club_name)} закрыт и перемещён "
+                f"с <code>{top_change['old_place']}</code> на последнее "
+                f"<code>{top_change['new_place']}</code> место."
+            )
+            await send_to_admin_group(context.bot, top_notice)
+            await self.notify_cis_subscribers(context.bot, top_notice)
+
+        for uid, _ in released_players:
+            if str(uid) == owner_id:
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text=f"❌ Клуб {club_name} был закрыт владельцем. Вы стали свободным агентом."
+                )
+            except Exception as exc:
+                logger.warning(f"Не удалось уведомить игрока {uid} о закрытии клуба: {exc}")
+
+        owner_nick = owner.get('roblox_nick', 'Не указан')
+        owner_username = owner.get('username') or 'Нет username'
+        channel_text = (
+            f"❌ │ ЗАКРЫТИЕ КЛУБА\n\n"
+            f"🏟 Клуб: {club_name}\n"
+            f"👥 Игроков освобождено: {len(released_players)}\n"
+            f"👑 Закрыл: {owner_nick} (@{owner_username})"
+        )
+        try:
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_text)
+        except Exception as exc:
+            logger.error(f"Ошибка отправки сообщения о закрытии клуба: {exc}")
+
+        await query.edit_message_text(
+            f"✅ Клуб {club_name} закрыт!\n\n👥 Свободными агентами стали: {len(released_players)} игроков.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")]])
+        )
     
     async def clubpanel_squad(self, update: Update, context: ContextTypes.DEFAULT_TYPE, club_name):
         query = update.callback_query
@@ -2008,8 +4087,8 @@ class FootballBot:
             return
         
         forwards = [p for p in club_players if p[1].get('position') == '⚽ Нападающий']
-        midfielders = [p for p in club_players if p[1].get('position') == '🔄 Полузащитник']
-        defenders = [p for p in club_players if p[1].get('position') == '🛡️ Защитник']
+        midfielders = [p for p in club_players if p[1].get('position') in {'🔄 Полузащитник', '🎯 Полузащитник'}]
+        universals = [p for p in club_players if p[1].get('position') == '🔄 Универсал']
         goalkeepers = [p for p in club_players if p[1].get('position') == '🧤 Вратарь']
         unknown = [p for p in club_players if p[1].get('position') == 'Не выбрана']
         
@@ -2022,14 +4101,14 @@ class FootballBot:
             text += "\n"
         
         if midfielders:
-            text += "🔄 ПОЛУЗАЩИТНИКИ:\n"
+            text += "🎯 ПОЛУЗАЩИТНИКИ:\n"
             for uid, p in midfielders:
                 text += f"  • {p.get('roblox_nick')} (@{p.get('username')}) — 🆔 {make_copyable(uid)}\n"
             text += "\n"
-        
-        if defenders:
-            text += "🛡️ ЗАЩИТНИКИ:\n"
-            for uid, p in defenders:
+
+        if universals:
+            text += "🔄 УНИВЕРСАЛЫ:\n"
+            for uid, p in universals:
                 text += f"  • {p.get('roblox_nick')} (@{p.get('username')}) — 🆔 {make_copyable(uid)}\n"
             text += "\n"
         
@@ -2066,7 +4145,9 @@ class FootballBot:
                 pos_emoji = ""
                 if transfer.get('position') == '⚽ Нападающий':
                     pos_emoji = "⚽"
-                elif transfer.get('position') == '🔄 Полузащитник':
+                elif transfer.get('position') in {'🔄 Полузащитник', '🎯 Полузащитник'}:
+                    pos_emoji = "🎯"
+                elif transfer.get('position') == '🔄 Универсал':
                     pos_emoji = "🔄"
                 elif transfer.get('position') == '🧤 Вратарь':
                     pos_emoji = "🧤"
@@ -2118,12 +4199,16 @@ class FootballBot:
             await query.edit_message_text(f"📋 В клубе {club_name} нет игроков для удаления", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"club_back_{club_name}")]]))
             return
         
-        keyboard = []
-        for uid, player in club_players:
-            keyboard.append([InlineKeyboardButton(f"❌ {player.get('roblox_nick')}", callback_data=f"kick_club_{uid}")])
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"club_back_{club_name}")])
+        buttons = [
+            InlineKeyboardButton(f"❌ {player.get('roblox_nick')}", callback_data=f"kick_club_{uid}")
+            for uid, player in club_players
+        ]
+        buttons.append(InlineKeyboardButton("◀️ Назад", callback_data=f"club_back_{club_name}"))
         
-        await query.edit_message_text(f"👑 ВЫГНАТЬ ИГРОКА ИЗ {club_name}\n\nВыберите игрока:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            f"👑 ВЫГНАТЬ ИГРОКА ИЗ {club_name}\n\nВыберите игрока:",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons))
+        )
     
     async def change_owner_club(self, update: Update, context: ContextTypes.DEFAULT_TYPE, club_name):
         query = update.callback_query
@@ -2163,7 +4248,11 @@ class FootballBot:
             return
         
         self.update_username(user_id, new_username)
-        await query.edit_message_text(f"✅ Ваш @Username успешно обновлен!\n\n📱 Новый username: @{new_username}")
+        await query.edit_message_text(
+            f"<b>✅ USERNAME ОБНОВЛЁН</b>\n\n"
+            f"📱 Новый username: <code>@{escape(new_username)}</code>",
+            parse_mode="HTML"
+        )
         await self.show_main_menu(update, context)
     
     async def kick_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2194,11 +4283,20 @@ class FootballBot:
             return
         
         old_club = target_user.get('club')
+        target_user['last_club'] = old_club
         target_user['club'] = None
         self.reset_transfer_club_cd(target_id)
         save_data(USERS_FILE, self.users)
-        
-        self.add_transfer_to_history(target_id, target_user.get('roblox_nick'), old_club, "Выгнан", admin_id, "club", target_user.get('position'))
+
+        self.add_transfer_to_history(
+            target_id,
+            target_user.get('roblox_nick'),
+            old_club,
+            "Свободный агент",
+            admin_id,
+            "club",
+            target_user.get('position')
+        )
         
         try:
             await context.bot.send_message(chat_id=int(target_id), text=f"❌ Вы были выгнаны из клуба {old_club}!")
@@ -2229,16 +4327,19 @@ class FootballBot:
             await query.edit_message_text("❌ Вы не являетесь владельцем сборной!")
             return
         
-        keyboard = [
-            [InlineKeyboardButton("📋 Состав сборной", callback_data="view_nation_squad")],
-            [InlineKeyboardButton("👑 Пригласить игрока", callback_data="nation_invite")],
-            [InlineKeyboardButton("🚪 Выгнать игрока", callback_data="kick_nation_player")],
-            [InlineKeyboardButton("👑 Смена владельца", callback_data=f"change_owner_nation_{owner_nation}")],
-            [InlineKeyboardButton("🔍 Поиск товарняка", callback_data=f"match_search_nation_{owner_nation}")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]
+        buttons = [
+            InlineKeyboardButton("📋 Состав сборной", callback_data="view_nation_squad"),
+            InlineKeyboardButton("👑 Пригласить игрока", callback_data="nation_invite"),
+            InlineKeyboardButton("🚪 Выгнать игрока", callback_data="kick_nation_player"),
+            InlineKeyboardButton("👑 Смена владельца", callback_data=f"change_owner_nation_{owner_nation}"),
+            InlineKeyboardButton("🔍 Поиск товарняка", callback_data=f"match_search_nation_{owner_nation}"),
+            InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"),
         ]
         
-        await query.edit_message_text(f"🌏 УПРАВЛЕНИЕ СБОРНОЙ: {owner_nation}\n\nВыберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            f"🌏 УПРАВЛЕНИЕ СБОРНОЙ: {owner_nation}\n\nВыберите действие:",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons))
+        )
     
     async def view_nation_squad(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -2260,8 +4361,8 @@ class FootballBot:
             return
         
         forwards = [p for p in nation_players if p[1].get('position') == '⚽ Нападающий']
-        midfielders = [p for p in nation_players if p[1].get('position') == '🔄 Полузащитник']
-        defenders = [p for p in nation_players if p[1].get('position') == '🛡️ Защитник']
+        midfielders = [p for p in nation_players if p[1].get('position') in {'🔄 Полузащитник', '🎯 Полузащитник'}]
+        universals = [p for p in nation_players if p[1].get('position') == '🔄 Универсал']
         goalkeepers = [p for p in nation_players if p[1].get('position') == '🧤 Вратарь']
         unknown = [p for p in nation_players if p[1].get('position') == 'Не выбрана']
         
@@ -2274,14 +4375,14 @@ class FootballBot:
             text += "\n"
         
         if midfielders:
-            text += "🔄 ПОЛУЗАЩИТНИКИ:\n"
+            text += "🎯 ПОЛУЗАЩИТНИКИ:\n"
             for uid, p in midfielders:
                 text += f"  • {p.get('roblox_nick')} (@{p.get('username')}) — 🆔 {make_copyable(uid)}\n"
             text += "\n"
-        
-        if defenders:
-            text += "🛡️ ЗАЩИТНИКИ:\n"
-            for uid, p in defenders:
+
+        if universals:
+            text += "🔄 УНИВЕРСАЛЫ:\n"
+            for uid, p in universals:
                 text += f"  • {p.get('roblox_nick')} (@{p.get('username')}) — 🆔 {make_copyable(uid)}\n"
             text += "\n"
         
@@ -2342,12 +4443,16 @@ class FootballBot:
             await query.edit_message_text(f"📋 В сборной {owner_nation} нет игроков для удаления", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="nation_management")]]))
             return
         
-        keyboard = []
-        for uid, player in nation_players:
-            keyboard.append([InlineKeyboardButton(f"❌ {player.get('roblox_nick')}", callback_data=f"kick_nation_{uid}")])
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="nation_management")])
+        buttons = [
+            InlineKeyboardButton(f"❌ {player.get('roblox_nick')}", callback_data=f"kick_nation_{uid}")
+            for uid, player in nation_players
+        ]
+        buttons.append(InlineKeyboardButton("◀️ Назад", callback_data="nation_management"))
         
-        await query.edit_message_text(f"🌏 ВЫГНАТЬ ИГРОКА ИЗ {owner_nation}\n\nВыберите игрока:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            f"🌏 ВЫГНАТЬ ИГРОКА ИЗ {owner_nation}\n\nВыберите игрока:",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons))
+        )
     
     async def kick_nation_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -2391,12 +4496,15 @@ class FootballBot:
     async def match_search_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, entity_type, entity_name):
         query = update.callback_query
         
-        keyboard = [
-            [InlineKeyboardButton("🔍 Найти товарняк", callback_data=f"find_match_{entity_type}_{entity_name}")],
-            [InlineKeyboardButton("◀️ Назад", callback_data=f"{entity_type}_management")]
+        buttons = [
+            InlineKeyboardButton("🔍 Найти товарняк", callback_data=f"find_match_{entity_type}_{entity_name}"),
+            InlineKeyboardButton("◀️ Назад", callback_data=f"{entity_type}_management"),
         ]
         
-        await query.edit_message_text(f"🔍 ПОИСК ТОВАРНЯКА\n\nКоманда: {entity_name}\nТип: {'Клуб' if entity_type == 'club' else 'Сборная'}", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            f"🔍 ПОИСК ТОВАРНЯКА\n\nКоманда: {entity_name}\nТип: {'Клуб' if entity_type == 'club' else 'Сборная'}",
+            reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons))
+        )
     
     async def find_match(self, update: Update, context: ContextTypes.DEFAULT_TYPE, entity_type, entity_name):
         query = update.callback_query
@@ -2406,7 +4514,7 @@ class FootballBot:
         context.user_data['match_entity'] = entity_name
         context.user_data['waiting_for'] = 'match_format'
         
-        await query.edit_message_text(f"🔍 ПОИСК ТОВАРНЯКА\n\nКоманда: {entity_name}\n\nВведите формат матча (например: 3x3, 4x4, 5x5):")
+        await query.edit_message_text(f"<b><u>🔍 ПОИСК ТОВАРНЯКА</u></b>\n\nКоманда: <i>{escape(str(entity_name))}</i>\n\nВведите формат матча, например: <code>3x3</code>, <code>4x4</code>, <code>5x5</code>:", reply_markup=back_keyboard(f"{entity_type}_management"), parse_mode='HTML')
     
     async def process_match_format(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
@@ -2419,7 +4527,7 @@ class FootballBot:
         
         await send_to_match_group(update.get_bot(), match_text)
         
-        request_id = str(len(self.match_requests) + 1)
+        request_id = new_request_id(self.match_requests)
         self.match_requests[request_id] = {
             "id": request_id,
             "user_id": user_id,
@@ -2479,8 +4587,8 @@ class FootballBot:
         
         context.user_data['waiting_for'] = 'career_comment'
         await query.edit_message_text(
-            "🥀 ЗАВЕРШЕНИЕ КАРЬЕРЫ\n\n"
-            "Напишите комментарий о завершении карьеры:"
+            "<b><u>🥀 ЗАВЕРШЕНИЕ КАРЬЕРЫ</u></b>\n\n<i>Напишите комментарий о завершении карьеры:</i>",
+            reply_markup=back_keyboard(), parse_mode='HTML'
         )
     
     async def end_career_no(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2489,27 +4597,19 @@ class FootballBot:
         await self.show_main_menu(update, context)
     
     async def restore_career_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        user_id = str(query.from_user.id)
+        """Старый callback оставлен для совместимости со старыми сообщениями.
+
+        Бесплатная заявка больше не создаётся: досрочное возвращение карьеры
+        доступно только после успешной оплаты Telegram Stars.
+        """
+        user_id = str(update.effective_user.id)
         user = self.users.get(user_id, {})
-        
         if user.get('career_active', True):
-            await query.edit_message_text("❌ Ваша карьера уже активна!")
+            await update.callback_query.answer("Ваша карьера уже активна.", show_alert=True)
             await self.show_main_menu(update, context)
             return
-        
-        if not are_announcements_open():
-            await query.edit_message_text("🔒 В настоящее время администраторы не принимают заявки. Попробуйте позже.")
-            return
-        
-        context.user_data['waiting_for'] = 'restore_career_comment'
-        await query.edit_message_text(
-            "🔄 ВОЗВРАЩЕНИЕ КАРЬЕРЫ\n\n"
-            "Напишите комментарий о возвращении (почему возвращаетесь, планы и т.д.):\n\n"
-            "💡 Комментарий будет отправлен администраторам на одобрение.\n"
-            "После одобрения вы станете свободным агентом."
-        )
-    
+        await self.create_donation_invoice(update, context, "restore")
+
     async def process_career_comment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         comment = update.message.text
@@ -2528,7 +4628,7 @@ class FootballBot:
             await self.show_main_menu(update, context)
             return
         
-        request_id = str(len(self.career_requests) + 1)
+        request_id = new_request_id(self.career_requests)
         self.career_requests[request_id] = {
             "id": request_id,
             "user_id": user_id,
@@ -2579,7 +4679,7 @@ class FootballBot:
             await self.show_main_menu(update, context)
             return
         
-        request_id = str(len(self.career_requests) + 1)
+        request_id = new_request_id(self.career_requests)
         self.career_requests[request_id] = {
             "id": request_id,
             "user_id": user_id,
@@ -2650,13 +4750,19 @@ class FootballBot:
             await self.show_main_menu(update, context)
             return
         
+        if is_roblox_nick_taken(new_nick, self.users, exclude_user_id=user_id):
+            await update.message.reply_text("❌ Такой Roblox ник уже занят другим пользователем!")
+            del context.user_data['waiting_for']
+            await self.show_main_menu(update, context)
+            return
+        
         if not are_announcements_open():
             await update.message.reply_text("🔒 В настоящее время администраторы не принимают заявки. Попробуйте позже.")
             del context.user_data['waiting_for']
             await self.show_main_menu(update, context)
             return
         
-        request_id = str(len(self.nick_requests) + 1)
+        request_id = new_request_id(self.nick_requests)
         self.nick_requests[request_id] = {
             "id": request_id,
             "user_id": user_id,
@@ -2711,6 +4817,18 @@ class FootballBot:
         user_id = request['user_id']
         new_nick = request['new_nick']
         
+        if is_roblox_nick_taken(new_nick, self.users, exclude_user_id=user_id):
+            request['status'] = 'rejected'
+            request['rejected_by'] = admin_id
+            request['rejected_at'] = datetime.now().isoformat()
+            save_data(NICK_CHANGE_REQUESTS_FILE, self.nick_requests)
+            await query.edit_message_text(f"{query.message.text}\n\n❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: такой Roblox ник уже занят")
+            try:
+                await context.bot.send_message(chat_id=int(user_id), text=f"❌ Ваша заявка на смену ника отклонена!\n\n📝 Причина: такой Roblox ник уже занят{premium_moderator_suffix(user_id, 'rejected', admin_name)}")
+            except Exception as e:
+                logger.error(f"Ошибка уведомления пользователя: {e}")
+            return
+        
         self.users[user_id]['roblox_nick'] = new_nick
         self.users[user_id]['last_nick_change'] = datetime.now().isoformat()
         save_data(USERS_FILE, self.users)
@@ -2721,7 +4839,7 @@ class FootballBot:
         save_data(NICK_CHANGE_REQUESTS_FILE, self.nick_requests)
         
         try:
-            await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваш ник успешно изменен!\n\nСтарый ник: {request['old_nick']}\nНовый ник: {new_nick}\n\n⚠️ Следующая смена ника будет доступна через 7 дней.\n\n✅ Вашу заявку принял @{admin_name}")
+            await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваш ник успешно изменен!\n\nСтарый ник: {request['old_nick']}\nНовый ник: {new_nick}\n\n⚠️ Следующая смена ника будет доступна через 7 дней.{premium_moderator_suffix(user_id, 'accepted', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
         
@@ -2764,6 +4882,10 @@ class FootballBot:
             return
         
         players_count = get_club_players_count(club_found, self.users)
+        allowed_by_nation_rule, nation_rule_error = can_assign_player_to_club(target_user_id, club_found, self.users)
+        if not allowed_by_nation_rule:
+            await update.message.reply_text(nation_rule_error)
+            return
         if players_count >= MAX_PLAYERS_PER_CLUB:
             await update.message.reply_text(f"❌ В клубе {club_found} уже {MAX_PLAYERS_PER_CLUB} игроков!")
             return
@@ -2784,10 +4906,10 @@ class FootballBot:
         position = target_user.get('position', 'Не указана')
         self.add_transfer_to_history(target_user_id, target_user.get('roblox_nick'), old_club, club_found, user_id, "club", position)
         
-        await update.message.reply_text(f"✅ Игрок {make_copyable(target_user.get('roblox_nick'))} переведен в клуб {club_found}!\n\nБыл: {old_club if old_club else 'Свободный агент'}\nСтал: {club_found}")
+        await update.message.reply_text(f"✅ Игрок {make_copyable(target_user.get('roblox_nick'))} переведен в клуб {club_found}!\n\nБыл: {old_club if old_club else 'Свободный агент'}\nСтал: {club_found}", parse_mode='HTML')
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Администратор перевел вас в клуб {club_found}!\n\n⚠️ Следующий переход в клуб будет доступен через 2 дня.\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Администратор перевел вас в клуб {club_found}!\n\n⚠️ Следующий переход в клуб будет доступен через 2 дня.{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
         
@@ -2832,6 +4954,10 @@ class FootballBot:
             return
         
         players_count = get_nation_players_count(nation_found, self.users)
+        allowed_by_club_rule, club_rule_error = can_assign_player_to_nation(target_user_id, nation_found, self.users)
+        if not allowed_by_club_rule:
+            await update.message.reply_text(club_rule_error)
+            return
         if players_count >= MAX_PLAYERS_PER_NATION:
             await update.message.reply_text(f"❌ В сборной {nation_found} уже {MAX_PLAYERS_PER_NATION} игроков!")
             return
@@ -2849,21 +4975,20 @@ class FootballBot:
         target_user['last_transfer_nation_date'] = datetime.now().isoformat()
         save_data(USERS_FILE, self.users)
         
-        self.history["transfers"].append({
-            "user_id": target_user_id,
-            "player": target_user.get('roblox_nick'),
-            "from_nation": old_nation if old_nation else "Свободный агент",
-            "to_nation": nation_found,
-            "timestamp": datetime.now().isoformat(),
-            "admin": user_id,
-            "position": target_user.get('position', 'Не указана')
-        })
-        save_data(HISTORY_FILE, self.history)
+        self.add_transfer_to_history(
+            target_user_id,
+            target_user.get('roblox_nick'),
+            old_nation,
+            nation_found,
+            user_id,
+            "nation",
+            target_user.get('position', 'Не указана')
+        )
         
-        await update.message.reply_text(f"✅ Игрок {make_copyable(target_user.get('roblox_nick'))} переведен в сборную {nation_found}!\n\nБыл: {old_nation if old_nation else 'Свободный агент'}\nСтал: {nation_found}")
+        await update.message.reply_text(f"✅ Игрок {make_copyable(target_user.get('roblox_nick'))} переведен в сборную {nation_found}!\n\nБыл: {old_nation if old_nation else 'Свободный агент'}\nСтал: {nation_found}", parse_mode='HTML')
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Администратор перевел вас в сборную {nation_found}!\n\n⚠️ Следующий переход в сборную будет доступен через 2 дня.\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Администратор перевел вас в сборную {nation_found}!\n\n⚠️ Следующий переход в сборную будет доступен через 2 дня.{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
         
@@ -2912,6 +5037,15 @@ class FootballBot:
                 await update.message.reply_text(f"❌ У сборной {nation_found} уже есть владелец: {user.get('roblox_nick')}")
                 return
         
+        if target_user.get('nation') != nation_found:
+            allowed_by_club_rule, club_rule_error = can_assign_player_to_nation(target_user_id, nation_found, self.users)
+            if not allowed_by_club_rule:
+                await update.message.reply_text(club_rule_error)
+                return
+            if get_nation_players_count(nation_found, self.users) >= MAX_PLAYERS_PER_NATION:
+                await update.message.reply_text(f"❌ В сборной {nation_found} уже {MAX_PLAYERS_PER_NATION} игроков!")
+                return
+        
         target_user['nation_owner'] = nation_found
         target_user['nation'] = nation_found
         self.reset_transfer_nation_cd(target_user_id)
@@ -2921,14 +5055,14 @@ class FootballBot:
         channel_text = f"❗️🔥 Новая зарегистрированная сборная | {current_datetime}\n\n🏠 {nation_found} → {target_user.get('roblox_nick')} (@{target_user.get('username')})\n🆔 {make_copyable(target_user_id)}"
         
         try:
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_text, parse_mode='HTML')
+            await safe_send_message(context.bot, CHANNEL_ID, channel_text, parse_mode='HTML')
         except Exception as e:
             logger.error(f"Ошибка отправки в канал: {e}")
         
         await update.message.reply_text(f"✅ Игрок назначен владельцем сборной {nation_found} и автоматически переведен в сборную")
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Вы назначены владельцем сборной {nation_found}!\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Вы назначены владельцем сборной {nation_found}!{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -2990,14 +5124,14 @@ class FootballBot:
         channel_text = f"❌🔥 Закрытие сборной | {current_datetime}\n\n🏠 {old_nation} → {target_user.get('roblox_nick')} (@{target_user.get('username')})\n🆔 {make_copyable(target_user_id)}"
         
         try:
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_text, parse_mode='HTML')
+            await safe_send_message(context.bot, CHANNEL_ID, channel_text, parse_mode='HTML')
         except Exception as e:
             logger.error(f"Ошибка отправки в канал: {e}")
         
         await update.message.reply_text(f"✅ Владелец удален из сборной {old_nation}!\n👥 Все игроки сборной ({len(kicked_players)} чел.) стали свободными агентами, кулдауны сброшены.")
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"❌ Вы были сняты с должности владельца сборной {old_nation}!\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"❌ Вы были сняты с должности владельца сборной {old_nation}!{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -3023,14 +5157,18 @@ class FootballBot:
         
         old_nick = target_user.get('roblox_nick', 'Не указан')
         
+        if is_roblox_nick_taken(new_nick, self.users, exclude_user_id=target_user_id):
+            await update.message.reply_text("❌ Такой Roblox ник уже занят другим пользователем!")
+            return
+        
         target_user['roblox_nick'] = new_nick
         target_user['last_nick_change'] = datetime.now().isoformat()
         save_data(USERS_FILE, self.users)
         
-        await update.message.reply_text(f"✅ Ник изменен!\n👤 Пользователь: {make_copyable(target_query)}\nСтарый ник: {old_nick}\nНовый ник: {new_nick}", parse_mode='HTML')
+        await update.message.reply_text(f"✅ Ник изменен!\n👤 Пользователь: {make_copyable(target_query)}\nСтарый ник: {make_copyable(old_nick)}\nНовый ник: {make_copyable(new_nick)}", parse_mode='HTML')
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Администратор изменил ваш ник!\n\nСтарый ник: {old_nick}\nНовый ник: {new_nick}\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Администратор изменил ваш ник!\n\nСтарый ник: {old_nick}\nНовый ник: {new_nick}{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -3057,7 +5195,7 @@ class FootballBot:
         await update.message.reply_text(f"✅ Сброшены все кулдауны для пользователя {make_copyable(target_user.get('roblox_nick'))}\n\n• Кулдаун на трансферы в клубы сброшен\n• Кулдаун на трансферы в сборные сброшен\n• Кулдаун на смену ника сброшен\n• Кулдаун на поиск клуба сброшен\n• Кулдаун на поиск сборной сброшен\n• Кулдаун на команды /transfer_cl и /transfer_nt сброшен\n• Счетчик поисков для премиум сброшен", parse_mode='HTML')
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Администратор сбросил ваши кулдауны!\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Администратор сбросил ваши кулдауны!{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -3156,7 +5294,24 @@ class FootballBot:
         await update.message.reply_text(f"✅ Премиум статус {status} пользователю {make_copyable(target_user.get('roblox_nick'))}\n\nФишки премиум:\n• Сокращенное КД на поиск до 1 часа\n• 3 поиска клуба/сборной в день", parse_mode='HTML')
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"👑 Ваш премиум статус {status}!\n\nТеперь вам доступны:\n• КД на поиск - 1 час\n• 3 поиска в день\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            if status == "выдан":
+                premium_notice = (
+                    "<b><u>👑 ПРЕМИУМ-СТАТУС ВЫДАН</u></b>\n\n"
+                    "<b>Теперь вам доступны:</b>\n"
+                    "• Кулдаун поиска — <code>1 час</code>\n"
+                    "• До <code>3 поисков</code> в день\n"
+                    "• Просмотр <code>ТОП-15 СНГ</code>\n"
+                    "• Уведомления о матчах и страйках\n"
+                    "• Отображение модератора, обработавшего заявку"
+                    f"{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}"
+                )
+            else:
+                premium_notice = "<b><u>❌ ПРЕМИУМ-СТАТУС СНЯТ</u></b>"
+            await context.bot.send_message(
+                chat_id=int(target_user_id),
+                text=premium_notice,
+                parse_mode="HTML"
+            )
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -3195,6 +5350,15 @@ class FootballBot:
                 await update.message.reply_text(f"❌ У клуба {club_found} уже есть владелец: {user.get('roblox_nick')}")
                 return
         
+        if target_user.get('club') != club_found:
+            allowed_by_nation_rule, nation_rule_error = can_assign_player_to_club(target_user_id, club_found, self.users)
+            if not allowed_by_nation_rule:
+                await update.message.reply_text(nation_rule_error)
+                return
+            if get_club_players_count(club_found, self.users) >= MAX_PLAYERS_PER_CLUB:
+                await update.message.reply_text(f"❌ В клубе {club_found} уже {MAX_PLAYERS_PER_CLUB} игроков!")
+                return
+        
         target_user['club_owner'] = club_found
         target_user['club'] = club_found
         self.reset_transfer_club_cd(target_user_id)
@@ -3204,14 +5368,14 @@ class FootballBot:
         channel_text = f"❗️🔥 Новый зарегистрированный клуб | {current_datetime}\n\n🏠 {club_found} → {target_user.get('roblox_nick')} (@{target_user.get('username')})\n🆔 {make_copyable(target_user_id)}"
         
         try:
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_text, parse_mode='HTML')
+            await safe_send_message(context.bot, CHANNEL_ID, channel_text, parse_mode='HTML')
         except Exception as e:
             logger.error(f"Ошибка отправки в канал: {e}")
         
         await update.message.reply_text(f"✅ Игрок назначен владельцем клуба {club_found} и автоматически переведен в клуб")
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Вы назначены владельцем клуба {club_found}!\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Вы назначены владельцем клуба {club_found}!{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -3273,14 +5437,14 @@ class FootballBot:
         channel_text = f"❌🔥 Закрытие клуба | {current_datetime}\n\n🏠 {old_club} → {target_user.get('roblox_nick')} (@{target_user.get('username')})\n🆔 {make_copyable(target_user_id)}"
         
         try:
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_text, parse_mode='HTML')
+            await safe_send_message(context.bot, CHANNEL_ID, channel_text, parse_mode='HTML')
         except Exception as e:
             logger.error(f"Ошибка отправки в канал: {e}")
         
         await update.message.reply_text(f"✅ Владелец удален из клуба {old_club}!\n👥 Все игроки клуба ({len(kicked_players)} чел.) стали свободными агентами, кулдауны сброшены.")
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"❌ Вы были сняты с должности владельца клуба {old_club}!\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"❌ Вы были сняты с должности владельца клуба {old_club}!{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -3325,7 +5489,15 @@ class FootballBot:
             try:
                 await context.bot.send_message(chat_id=int(uid), text=text)
                 sent_count += 1
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.1)
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await context.bot.send_message(chat_id=int(uid), text=text)
+                    sent_count += 1
+                except Exception as retry_error:
+                    logger.error(f"Ошибка повторной отправки пользователю {uid}: {retry_error}")
+                    failed_count += 1
             except Exception as e:
                 logger.error(f"Ошибка отправки пользователю {uid}: {e}")
                 failed_count += 1
@@ -3343,7 +5515,11 @@ class FootballBot:
             await update.message.reply_text("❌ Использование: /ban [id] [срок] [причина]\n\nСрок: 7d, 30d, perm")
             return
         
-        target_user_id = int(context.args[0])
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Укажите числовой Telegram ID пользователя.")
+            return
         duration = context.args[1].lower()
         reason = ' '.join(context.args[2:])
         
@@ -3382,6 +5558,7 @@ class FootballBot:
         if "ban_info" not in self.bans:
             self.bans["ban_info"] = {}
         
+        ensure_user_record(self.users, target_user_id)
         self.bans["banned"].append(target_user_id)
         
         ban_end_date = None
@@ -3424,7 +5601,7 @@ class FootballBot:
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя о бане: {e}")
         
-        await update.message.reply_text(f"✅ Пользователь забанен {duration_text}\n📝 Причина: {reason}", parse_mode='HTML')
+        await update.message.reply_text(f"✅ Пользователь забанен {duration_text}\n📝 Причина: {reason}")
     
     async def unban_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
@@ -3448,15 +5625,15 @@ class FootballBot:
                 return
             target_user_id = int(found_id)
         
-        if target_user_id in self.bans.get("banned", []):
-            self.bans["banned"].remove(target_user_id)
+        if any(str(banned_id) == str(target_user_id) for banned_id in self.bans.get("banned", [])):
+            self.bans["banned"] = [banned_id for banned_id in self.bans.get("banned", []) if str(banned_id) != str(target_user_id)]
             if "ban_info" in self.bans and str(target_user_id) in self.bans["ban_info"]:
                 del self.bans["ban_info"][str(target_user_id)]
             save_data(BANS_FILE, self.bans)
             await update.message.reply_text(f"✅ Пользователь разбанен", parse_mode='HTML')
             
             try:
-                await context.bot.send_message(chat_id=target_user_id, text=f"✅ Вы были разбанены в боте!\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+                await context.bot.send_message(chat_id=target_user_id, text=f"✅ Вы были разбанены в боте!{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
             except Exception as e:
                 logger.error(f"Ошибка уведомления пользователя о разбане: {e}")
         else:
@@ -3470,7 +5647,7 @@ class FootballBot:
             return
         
         if not context.args:
-            await update.message.reply_text("❌ Использование: /player_end [id/ник]")
+            await update.message.reply_text("❌ Использование: /retire [id/ник]")
             return
         
         target_query = context.args[0]
@@ -3486,7 +5663,7 @@ class FootballBot:
             await self.remove_owner_from_nation(context, target_user_id, target_user.get('nation_owner'))
         
         self.users[target_user_id]['career_active'] = False
-        self.users[target_user_id]['career_end_date'] = datetime.now().isoformat()
+        self.users[target_user_id]['career_end_date'] = (datetime.now() + timedelta(days=30)).isoformat()
         self.users[target_user_id]['club'] = None
         self.users[target_user_id]['nation'] = None
         save_data(USERS_FILE, self.users)
@@ -3494,7 +5671,7 @@ class FootballBot:
         await update.message.reply_text(f"✅ Карьера игрока {make_copyable(target_user.get('roblox_nick'))} завершена, он снят с должностей", parse_mode='HTML')
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"❌ Ваша карьера завершена администратором!\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"❌ Ваша карьера завершена администратором!{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -3506,7 +5683,7 @@ class FootballBot:
             return
         
         if not context.args:
-            await update.message.reply_text("❌ Использование: /player_noend [id/ник]")
+            await update.message.reply_text("❌ Использование: /unretire [id/ник]")
             return
         
         target_query = context.args[0]
@@ -3525,12 +5702,12 @@ class FootballBot:
         await update.message.reply_text(f"✅ Карьера игрока {make_copyable(target_user.get('roblox_nick'))} восстановлена, теперь он свободный агент", parse_mode='HTML')
         
         try:
-            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Ваша карьера восстановлена администратором!\n\n✅ Вашу заявку принял @{update.effective_user.username}")
+            await context.bot.send_message(chat_id=int(target_user_id), text=f"✅ Ваша карьера восстановлена администратором!{premium_moderator_suffix(target_user_id, 'accepted', update.effective_user.username)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
     async def remove_owner_from_club(self, context, owner_id, club_name):
-        if club_name in self.users[owner_id].get('club_owner'):
+        if self.users.get(owner_id, {}).get('club_owner') == club_name:
             self.users[owner_id]['club_owner'] = None
             self.users[owner_id]['club'] = None
             self.reset_transfer_club_cd(owner_id)
@@ -3547,7 +5724,7 @@ class FootballBot:
             save_data(USERS_FILE, self.users)
     
     async def remove_owner_from_nation(self, context, owner_id, nation_name):
-        if nation_name in self.users[owner_id].get('nation_owner'):
+        if self.users.get(owner_id, {}).get('nation_owner') == nation_name:
             self.users[owner_id]['nation_owner'] = None
             self.users[owner_id]['nation'] = None
             self.reset_transfer_nation_cd(owner_id)
@@ -3630,7 +5807,7 @@ class FootballBot:
                 await query.edit_message_text("❌ Старый владелец уже не является владельцем этой сборной!")
                 return
         
-        request_id = str(len(self.owner_change_requests) + 1)
+        request_id = new_request_id(self.owner_change_requests)
         self.owner_change_requests[request_id] = {
             "id": request_id,
             "entity_type": entity_type,
@@ -3704,6 +5881,36 @@ class FootballBot:
         
         old_owner = self.users.get(old_owner_id, {})
         new_owner = self.users.get(new_owner_id, {})
+
+        # Смена владельца тоже не должна обходить лимит 3 игроков одного клуба в сборной.
+        if entity_type == 'club':
+            nation_name = new_owner.get('nation')
+            if nation_name:
+                same_club_count = count_same_club_in_nation(
+                    nation_name, entity_name, self.users, exclude_user_id=new_owner_id
+                )
+                if old_owner.get('club') == entity_name and old_owner.get('nation') == nation_name:
+                    same_club_count = max(0, same_club_count - 1)
+                if same_club_count >= MAX_SAME_CLUB_PER_NATION:
+                    await query.edit_message_text(
+                        f"❌ Смена владельца нарушит правило: в сборной {nation_name} уже "
+                        f"{MAX_SAME_CLUB_PER_NATION} игрока из клуба {entity_name}."
+                    )
+                    return
+        else:
+            club_name = new_owner.get('club')
+            if club_name:
+                same_club_count = count_same_club_in_nation(
+                    entity_name, club_name, self.users, exclude_user_id=new_owner_id
+                )
+                if old_owner.get('nation') == entity_name and old_owner.get('club') == club_name:
+                    same_club_count = max(0, same_club_count - 1)
+                if same_club_count >= MAX_SAME_CLUB_PER_NATION:
+                    await query.edit_message_text(
+                        f"❌ Смена владельца нарушит правило: в сборной {entity_name} уже "
+                        f"{MAX_SAME_CLUB_PER_NATION} игрока из клуба {club_name}."
+                    )
+                    return
         
         if entity_type == 'club':
             if old_owner.get('club_owner') != entity_name:
@@ -3742,54 +5949,39 @@ class FootballBot:
             logger.error(f"Ошибка отправки в канал: {e}")
         
         try:
-            await context.bot.send_message(chat_id=int(old_owner_id), text=f"✅ Администратор одобрил смену владельца!\n\nТеперь вы больше не владелец {entity_name}.\n\n✅ Вашу заявку принял @{admin_name}")
+            await context.bot.send_message(chat_id=int(old_owner_id), text=f"✅ Администратор одобрил смену владельца!\n\nТеперь вы больше не владелец {entity_name}.{premium_moderator_suffix(old_owner_id, 'accepted', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка: {e}")
         
         try:
-            await context.bot.send_message(chat_id=int(new_owner_id), text=f"✅ Администратор одобрил смену владельца!\n\nТеперь вы владелец {entity_name}!\n\n✅ Вашу заявку принял @{admin_name}")
+            await context.bot.send_message(chat_id=int(new_owner_id), text=f"✅ Администратор одобрил смену владельца!\n\nТеперь вы владелец {entity_name}!{premium_moderator_suffix(new_owner_id, 'accepted', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка: {e}")
         
         await query.edit_message_text(f"{query.message.text}\n\n✅ ОДОБРЕНО @{admin_name}")
     
     async def reject_owner_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        admin_id = str(query.from_user.id)
+        admin_id = str(update.effective_user.id)
         admin_name = update.effective_user.username
         request_id = context.user_data.get('reject_request_id')
         reason = context.user_data.get('reject_reason_text', 'Не указана')
-        original_message = context.user_data.get('reject_original_message')
-        
-        if request_id not in self.owner_change_requests:
-            await query.edit_message_text("❌ Запрос не найден!")
+        request = self.owner_change_requests.get(request_id)
+        if not request:
+            await update.message.reply_text("❌ Запрос не найден!")
             return
-        
-        request = self.owner_change_requests[request_id]
         if request.get('status') != 'pending':
-            await query.edit_message_text("❌ Этот запрос уже был обработан!")
+            await update.message.reply_text("❌ Этот запрос уже был обработан!")
             return
-        
-        request['status'] = 'rejected'
-        request['rejected_by'] = admin_id
-        request['rejected_at'] = datetime.now().isoformat()
+        request.update(status='rejected', rejected_by=admin_id, rejected_at=datetime.now().isoformat())
         save_data(OWNER_CHANGE_REQUESTS_FILE, self.owner_change_requests)
-        
-        if original_message:
-            await original_message.edit_text(f"{original_message.text}\n\n❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-        else:
-            await query.edit_message_text(f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-        
-        try:
-            await context.bot.send_message(chat_id=int(request['new_owner_id']), text=f"❌ Заявка на смену владельца отклонена!\n\n📝 Причина: {reason}\n\n❌ Вашу заявку отклонил @{admin_name}")
-        except Exception as e:
-            logger.error(f"Ошибка уведомления пользователя: {e}")
-        
-        try:
-            await context.bot.send_message(chat_id=int(request['old_owner_id']), text=f"❌ Заявка на смену владельца отклонена!\n\n📝 Причина: {reason}\n\n❌ Вашу заявку отклонил @{admin_name}")
-        except Exception as e:
-            logger.error(f"Ошибка уведомления пользователя: {e}")
-    
+        await self._finish_rejection(update, context, f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
+        for target_id in (request['new_owner_id'], request['old_owner_id']):
+            try:
+                suffix = premium_moderator_suffix(target_id, "rejected", admin_name)
+                await context.bot.send_message(chat_id=int(target_id), text=f"❌ Заявка на смену владельца отклонена!\n\n📝 Причина: {reason}{suffix}")
+            except Exception as e:
+                logger.error(f"Ошибка уведомления пользователя: {e}")
+
     async def ignore_owner_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         admin_id = str(query.from_user.id)
@@ -3818,12 +6010,12 @@ class FootballBot:
         await query.edit_message_text(f"{query.message.text}\n\n😴 ПРОИГНОРИРОВАНО @{admin_name}")
         
         try:
-            await context.bot.send_message(chat_id=int(request['new_owner_id']), text=f"😴 Вашу заявку на смену владельца проигнорировал @{admin_name}")
+            await context.bot.send_message(chat_id=int(request['new_owner_id']), text=f"😴 Ваша заявка на смену владельца проигнорирована.{premium_moderator_suffix(request['new_owner_id'], 'ignored', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
         
         try:
-            await context.bot.send_message(chat_id=int(request['old_owner_id']), text=f"😴 Вашу заявку на смену владельца проигнорировал @{admin_name}")
+            await context.bot.send_message(chat_id=int(request['old_owner_id']), text=f"😴 Ваша заявка на смену владельца проигнорирована.{premium_moderator_suffix(request['old_owner_id'], 'ignored', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -3844,8 +6036,8 @@ class FootballBot:
                         expired_users.append(user_id)
         
         for user_id in expired_users:
-            if user_id in bans["banned"]:
-                bans["banned"].remove(user_id)
+            if any(str(banned_id) == str(user_id) for banned_id in bans.get("banned", [])):
+                bans["banned"] = [banned_id for banned_id in bans.get("banned", []) if str(banned_id) != str(user_id)]
                 if "ban_info" in bans and str(user_id) in bans["ban_info"]:
                     del bans["ban_info"][str(user_id)]
                 
@@ -3883,6 +6075,17 @@ class FootballBot:
             logger.info(f"Автоматически восстановлено {restored} карьер")
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Обычный текст бот обрабатывает только в ЛС. В группах оставлены только
+        # служебные ответы администраторов после нажатия кнопок заявок.
+        waiting_for = context.user_data.get('waiting_for')
+        group_service_states = {
+            'reject_reason',
+            'support_reply',
+            'moder_complaint_reply',
+        }
+        if update.effective_chat.type != 'private' and waiting_for not in group_service_states:
+            return
+
         user_id = str(update.effective_user.id)
         username = update.effective_user.username
         
@@ -3890,10 +6093,48 @@ class FootballBot:
             self.update_username(user_id, username)
         
         if 'waiting_for' not in context.user_data:
+            if self.registration_is_pending(user_id):
+                await self.resume_registration(update, context)
             return
-        
+
         text = update.message.text
-        
+
+        if context.user_data.get('waiting_for') == 'moder_complaint_reply':
+            if update.effective_user.id != CREATOR_ID:
+                await update.message.reply_text("❌ Нет доступа.")
+                return
+            complaint_id = context.user_data.get('moder_complaint_id')
+            complaint = self.moder_complaints.get(complaint_id)
+            if not complaint or complaint.get('status') != 'pending':
+                await update.message.reply_text("❌ Жалоба уже обработана или не найдена.")
+            else:
+                complaint['status'] = 'answered'
+                complaint['answer'] = text
+                complaint['processed_at'] = datetime.now().isoformat()
+                save_data(MODER_COMPLAINTS_FILE, self.moder_complaints)
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(complaint['user_id']),
+                        text=f"💬 Ответ создателя по вашей жалобе на модератора @{complaint.get('moder_username', 'Нет username')}:\n\n{text}"
+                    )
+                    await update.message.reply_text("✅ Ответ отправлен игроку.")
+                except Exception as exc:
+                    logger.error(f"Ошибка отправки ответа по жалобе: {exc}")
+                    await update.message.reply_text("❌ Не удалось отправить ответ игроку.")
+                try:
+                    creator_text = complaint.get('creator_text', 'Жалоба на модератора')
+                    await context.bot.edit_message_text(
+                        chat_id=complaint.get('creator_chat_id', CREATOR_ID),
+                        message_id=complaint.get('creator_message_id'),
+                        text=f"{creator_text}\n\n✅ ОТВЕЧЕНО",
+                        parse_mode='HTML'
+                    )
+                except Exception as exc:
+                    logger.warning(f"Не удалось обновить сообщение жалобы: {exc}")
+            context.user_data.pop('moder_complaint_id', None)
+            context.user_data.pop('waiting_for', None)
+            return
+
         if is_banned(int(user_id)):
             await update.message.reply_text("❌ Вы забанены в боте.")
             return
@@ -3925,10 +6166,42 @@ class FootballBot:
                 "last_transfer_nation_date": None,
                 "last_transfer_cmd": None,
                 "searches_today": 0,
-                "last_search_reset": None
+                "last_search_reset": None,
+                "registration_completed": False,
+                "registration_stage": "nick"
             }
             save_data(USERS_FILE, self.users)
         
+        if context.user_data.get('waiting_for') == 'registration_nick':
+            new_nick = (text or "").strip()
+            if len(new_nick) < 2 or len(new_nick) > 32:
+                await update.message.reply_text("❌ Ник должен содержать от 2 до 32 символов.")
+                return
+            if any(ord(char) < 32 for char in new_nick):
+                await update.message.reply_text("❌ Ник содержит недопустимые символы.")
+                return
+            if new_nick.lower() == "не указан":
+                await update.message.reply_text("❌ Введите настоящий дисплейный ник из Roblox.")
+                return
+            if is_roblox_nick_taken(new_nick, self.users, exclude_user_id=user_id):
+                await update.message.reply_text("❌ Такой Roblox ник уже занят другим пользователем!")
+                return
+
+            self.users[user_id]["roblox_nick"] = new_nick
+            self.users[user_id]["registration_stage"] = "position"
+            save_data(USERS_FILE, self.users)
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"✅ Ник сохранён: {make_copyable(new_nick)}",
+                parse_mode="HTML"
+            )
+            await self.show_registration_position(update, context)
+            return
+
+        if context.user_data.get('waiting_for') == 'registration_search_requirements':
+            await self.process_registration_club_search(update, context)
+            return
+
         if context.user_data.get('waiting_for') == 'change_owner_nick':
             target_nick = text.strip()
             entity_type = context.user_data.get('change_owner_type')
@@ -3996,7 +6269,7 @@ class FootballBot:
             user = self.users.get(user_id, {})
             
             ad_data = {
-                "id": str(len(self.ads) + 1),
+                "id": new_request_id(self.ads),
                 "user_id": user_id,
                 "username": update.effective_user.username,
                 "text": text,
@@ -4071,7 +6344,7 @@ class FootballBot:
                     return
                 
                 # Создаем заявку на поиск клуба для админов
-                request_id = str(len(self.search_requests) + 1)
+                request_id = new_request_id(self.search_requests)
                 self.search_requests[request_id] = {
                     "id": request_id,
                     "user_id": user_id,
@@ -4120,7 +6393,7 @@ class FootballBot:
                     return
                 
                 # Создаем заявку на поиск сборной для админов
-                request_id = str(len(self.search_requests) + 1)
+                request_id = new_request_id(self.search_requests)
                 self.search_requests[request_id] = {
                     "id": request_id,
                     "user_id": user_id,
@@ -4308,7 +6581,7 @@ class FootballBot:
             return
         
         if context.user_data.get('waiting_for') == 'support':
-            support_id = str(len(self.support) + 1)
+            support_id = new_request_id(self.support)
             support_data = {
                 "id": support_id,
                 "user_id": user_id,
@@ -4359,7 +6632,7 @@ class FootballBot:
                 save_data(SUPPORT_FILE, self.support)
                 
                 try:
-                    await context.bot.send_message(chat_id=int(target_user_id), text=f"🆘 ОТВЕТ НА ВАШЕ ОБРАЩЕНИЕ\n\n{reply_text}\n\n✅ Ответил: @{update.effective_user.username}")
+                    await context.bot.send_message(chat_id=int(target_user_id), text=f"🆘 ОТВЕТ НА ВАШЕ ОБРАЩЕНИЕ\n\n{reply_text}{premium_moderator_suffix(target_user_id, 'answered', update.effective_user.username)}")
                     await update.message.reply_text(f"✅ Ответ отправлен пользователю!")
                 except Exception as e:
                     logger.error(f"Ошибка отправки ответа: {e}")
@@ -4421,7 +6694,7 @@ class FootballBot:
             try:
                 await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_text)
                 await query.edit_message_text(f"{query.message.text}\n\n✅ ОДОБРЕНО @{admin_name}")
-                await context.bot.send_message(chat_id=int(ad['user_id']), text=f"✅ Ваше объявление опубликовано в канале!\n\n✅ Одобрил: @{admin_name}")
+                await context.bot.send_message(chat_id=int(ad['user_id']), text=f"✅ Ваше объявление опубликовано в канале!{premium_moderator_suffix(ad['user_id'], 'approved', admin_name)}")
                 
                 if ad['ad_type'] == 'recruitment_club':
                     self.add_recruitment_club_post(ad['user_id'])
@@ -4431,29 +6704,27 @@ class FootballBot:
                 logger.error(f"Ошибка: {e}")
     
     async def reject_ad(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        admin_id = str(query.from_user.id)
         admin_name = update.effective_user.username
         request_id = context.user_data.get('reject_request_id')
         reason = context.user_data.get('reject_reason_text', 'Не указана')
-        original_message = context.user_data.get('reject_original_message')
-        
-        if request_id in self.ads:
-            ad = self.ads[request_id]
-            if ad.get('status') != 'pending':
-                await query.edit_message_text("❌ Эта заявка уже была обработана!")
-                return
-            ad['status'] = 'rejected'
-            save_data(ADS_FILE, self.ads)
-            if original_message:
-                await original_message.edit_text(f"{original_message.text}\n\n❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-            else:
-                await query.edit_message_text(f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-            try:
-                await context.bot.send_message(chat_id=int(ad['user_id']), text=f"❌ Ваше объявление отклонено администратором!\n\n📝 Причина: {reason}\n\n❌ Отклонил: @{admin_name}")
-            except Exception as e:
-                logger.error(f"Ошибка уведомления пользователя: {e}")
-    
+        ad = self.ads.get(request_id)
+        if not ad:
+            await update.message.reply_text("❌ Заявка не найдена!")
+            return
+        if ad.get('status') != 'pending':
+            await update.message.reply_text("❌ Эта заявка уже была обработана!")
+            return
+        ad['status'] = 'rejected'
+        ad['rejected_by'] = str(update.effective_user.id)
+        ad['rejected_at'] = datetime.now().isoformat()
+        save_data(ADS_FILE, self.ads)
+        await self._finish_rejection(update, context, f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
+        try:
+            suffix = premium_moderator_suffix(ad['user_id'], "rejected", admin_name)
+            await context.bot.send_message(chat_id=int(ad['user_id']), text=f"❌ Ваше объявление отклонено администратором!\n\n📝 Причина: {reason}{suffix}")
+        except Exception as e:
+            logger.error(f"Ошибка уведомления пользователя: {e}")
+
     async def ignore_ad(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         admin_id = str(query.from_user.id)
@@ -4468,7 +6739,7 @@ class FootballBot:
             save_data(ADS_FILE, self.ads)
             await query.edit_message_text(f"{query.message.text}\n\n😴 ПРОИГНОРИРОВАНО @{admin_name}")
             try:
-                await context.bot.send_message(chat_id=int(ad['user_id']), text=f"😴 Ваше объявление проигнорировано администратором!\n\n😴 Проигнорировал: @{admin_name}")
+                await context.bot.send_message(chat_id=int(ad['user_id']), text=f"😴 Ваше объявление проигнорировано администратором!{premium_moderator_suffix(ad['user_id'], 'ignored', admin_name)}")
             except Exception as e:
                 logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -4489,10 +6760,19 @@ class FootballBot:
             user_id = request['user_id']
             search_type = request['search_type']
             
-            # Обновляем кулдаун и счетчик поисков
+            # Обновляем команду, кулдаун и счетчик поисков только после одобрения
+            ensure_user_record(self.users, user_id)
             if search_type == 'club':
+                old_club = self.users[user_id].get('club')
+                if old_club:
+                    self.users[user_id]['last_club'] = old_club
+                self.users[user_id]['club'] = None
                 self.users[user_id]['last_search_club_date'] = datetime.now().isoformat()
             else:
+                old_nation = self.users[user_id].get('nation')
+                if old_nation:
+                    self.users[user_id]['last_nation'] = old_nation
+                self.users[user_id]['nation'] = None
                 self.users[user_id]['last_search_nation_date'] = datetime.now().isoformat()
             self.increment_search_count(user_id)
             save_data(USERS_FILE, self.users)
@@ -4518,34 +6798,30 @@ class FootballBot:
             try:
                 await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_text)
                 await query.edit_message_text(f"{query.message.text}\n\n✅ ОДОБРЕНО @{admin_name}")
-                await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваша заявка на поиск одобрена и опубликована в канале!\n\n✅ Одобрил: @{admin_name}")
+                await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваша заявка на поиск одобрена и опубликована в канале!{premium_moderator_suffix(user_id, 'approved', admin_name)}")
             except Exception as e:
                 logger.error(f"Ошибка отправки в канал: {e}")
     
     async def reject_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        admin_id = str(query.from_user.id)
         admin_name = update.effective_user.username
         request_id = context.user_data.get('reject_request_id')
         reason = context.user_data.get('reject_reason_text', 'Не указана')
-        original_message = context.user_data.get('reject_original_message')
-        
-        if request_id in self.search_requests:
-            request = self.search_requests[request_id]
-            if request.get('status') != 'pending':
-                await query.edit_message_text("❌ Эта заявка уже была обработана!")
-                return
-            request['status'] = 'rejected'
-            save_data(SEARCH_REQUESTS_FILE, self.search_requests)
-            if original_message:
-                await original_message.edit_text(f"{original_message.text}\n\n❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-            else:
-                await query.edit_message_text(f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-            try:
-                await context.bot.send_message(chat_id=int(request['user_id']), text=f"❌ Ваша заявка на поиск отклонена!\n\n📝 Причина: {reason}\n\n❌ Отклонил: @{admin_name}")
-            except Exception as e:
-                logger.error(f"Ошибка уведомления пользователя: {e}")
-    
+        request = self.search_requests.get(request_id)
+        if not request:
+            await update.message.reply_text("❌ Заявка не найдена!")
+            return
+        if request.get('status') != 'pending':
+            await update.message.reply_text("❌ Эта заявка уже была обработана!")
+            return
+        request.update(status='rejected', rejected_by=str(update.effective_user.id), rejected_at=datetime.now().isoformat())
+        save_data(SEARCH_REQUESTS_FILE, self.search_requests)
+        await self._finish_rejection(update, context, f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
+        try:
+            suffix = premium_moderator_suffix(request['user_id'], "rejected", admin_name)
+            await context.bot.send_message(chat_id=int(request['user_id']), text=f"❌ Ваша заявка на поиск отклонена!\n\n📝 Причина: {reason}{suffix}")
+        except Exception as e:
+            logger.error(f"Ошибка уведомления пользователя: {e}")
+
     async def ignore_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         admin_id = str(query.from_user.id)
@@ -4561,7 +6837,7 @@ class FootballBot:
             save_data(SEARCH_REQUESTS_FILE, self.search_requests)
             await query.edit_message_text(f"{query.message.text}\n\n😴 ПРОИГНОРИРОВАНО @{admin_name}")
             try:
-                await context.bot.send_message(chat_id=int(request['user_id']), text=f"😴 Ваша заявка на поиск проигнорирована администратором!\n\n😴 Проигнорировал: @{admin_name}")
+                await context.bot.send_message(chat_id=int(request['user_id']), text=f"😴 Ваша заявка на поиск проигнорирована администратором!{premium_moderator_suffix(request['user_id'], 'ignored', admin_name)}")
             except Exception as e:
                 logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -4581,29 +6857,25 @@ class FootballBot:
             await query.edit_message_text(f"{query.message.text}\n\n✏️ Введите текст ответа для пользователя:")
     
     async def reject_support(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        admin_id = str(query.from_user.id)
         admin_name = update.effective_user.username
         request_id = context.user_data.get('reject_request_id')
         reason = context.user_data.get('reject_reason_text', 'Не указана')
-        original_message = context.user_data.get('reject_original_message')
-        
-        if request_id in self.support:
-            support = self.support[request_id]
-            if support.get('status') != 'pending':
-                await query.edit_message_text("❌ Эта заявка уже была обработана!")
-                return
-            support['status'] = 'rejected'
-            save_data(SUPPORT_FILE, self.support)
-            if original_message:
-                await original_message.edit_text(f"{original_message.text}\n\n❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-            else:
-                await query.edit_message_text(f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-            try:
-                await context.bot.send_message(chat_id=int(support['user_id']), text=f"❌ Ваше обращение в поддержку отклонено!\n\n📝 Причина: {reason}\n\n❌ Отклонил: @{admin_name}")
-            except Exception as e:
-                logger.error(f"Ошибка уведомления пользователя: {e}")
-    
+        support = self.support.get(request_id)
+        if not support:
+            await update.message.reply_text("❌ Обращение не найдено!")
+            return
+        if support.get('status') != 'pending':
+            await update.message.reply_text("❌ Это обращение уже было обработано!")
+            return
+        support.update(status='rejected', rejected_by=str(update.effective_user.id), rejected_at=datetime.now().isoformat())
+        save_data(SUPPORT_FILE, self.support)
+        await self._finish_rejection(update, context, f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
+        try:
+            suffix = premium_moderator_suffix(support['user_id'], "rejected", admin_name)
+            await context.bot.send_message(chat_id=int(support['user_id']), text=f"❌ Ваше обращение в поддержку отклонено!\n\n📝 Причина: {reason}{suffix}")
+        except Exception as e:
+            logger.error(f"Ошибка уведомления пользователя: {e}")
+
     async def ignore_support(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         admin_id = str(query.from_user.id)
@@ -4618,7 +6890,7 @@ class FootballBot:
             save_data(SUPPORT_FILE, self.support)
             await query.edit_message_text(f"{query.message.text}\n\n😴 ПРОИГНОРИРОВАНО @{admin_name}")
             try:
-                await context.bot.send_message(chat_id=int(support['user_id']), text=f"😴 Ваше обращение в поддержку проигнорировано администратором!\n\n😴 Проигнорировал: @{admin_name}")
+                await context.bot.send_message(chat_id=int(support['user_id']), text=f"😴 Ваше обращение в поддержку проигнорировано администратором!{premium_moderator_suffix(support['user_id'], 'ignored', admin_name)}")
             except Exception as e:
                 logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -4659,7 +6931,7 @@ class FootballBot:
             save_data(CAREER_REQUESTS_FILE, self.career_requests)
             
             try:
-                await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваша карьера успешно восстановлена!\n\nТеперь вы свободный агент.\n\nВаш комментарий: {comment}\n\n✅ Одобрил: @{admin_name}")
+                await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваша карьера успешно восстановлена!\n\nТеперь вы свободный агент.\n\nВаш комментарий: {comment}{premium_moderator_suffix(user_id, 'approved', admin_name)}")
             except Exception as e:
                 logger.error(f"Ошибка уведомления пользователя: {e}")
             
@@ -4687,7 +6959,7 @@ class FootballBot:
             save_data(CAREER_REQUESTS_FILE, self.career_requests)
             
             try:
-                await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваша карьера успешно завершена!\n\n📅 Авто-возврат через 30 дней.\n\nВаш комментарий: {comment}\n\n✅ Одобрил: @{admin_name}")
+                await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваша карьера успешно завершена!\n\n📅 Авто-возврат через 30 дней.\n\nВаш комментарий: {comment}{premium_moderator_suffix(user_id, 'approved', admin_name)}")
             except Exception as e:
                 logger.error(f"Ошибка уведомления пользователя: {e}")
             
@@ -4700,53 +6972,37 @@ class FootballBot:
         await query.edit_message_text(f"{query.message.text}\n\n✅ ОДОБРЕНО @{admin_name}")
     
     async def reject_career(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        admin_id = str(query.from_user.id)
+        admin_id = str(update.effective_user.id)
         admin_name = update.effective_user.username
         request_id = context.user_data.get('reject_request_id')
         reason = context.user_data.get('reject_reason_text', 'Не указана')
-        original_message = context.user_data.get('reject_original_message')
-        
-        if request_id not in self.career_requests:
-            await query.edit_message_text("❌ Запрос не найден!")
+        request = self.career_requests.get(request_id)
+        if not request:
+            await update.message.reply_text("❌ Запрос не найден!")
             return
-        
-        request = self.career_requests[request_id]
         if request.get('status') != 'pending':
-            await query.edit_message_text("❌ Этот запрос уже был обработан!")
+            await update.message.reply_text("❌ Этот запрос уже был обработан!")
             return
-        
-        request['status'] = 'rejected'
-        request['rejected_by'] = admin_id
-        request['rejected_at'] = datetime.now().isoformat()
+        request.update(status='rejected', rejected_by=admin_id, rejected_at=datetime.now().isoformat())
         save_data(CAREER_REQUESTS_FILE, self.career_requests)
-        
-        if original_message:
-            await original_message.edit_text(f"{original_message.text}\n\n❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-        else:
-            await query.edit_message_text(f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-        
+        await self._finish_rejection(update, context, f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
+        target_user_id = request['user_id']
+        suffix = premium_moderator_suffix(target_user_id, "rejected", admin_name)
         try:
-            target_user_id = request['user_id']
-            
             if request.get('type') == 'restore':
                 user = self.users.get(target_user_id, {})
                 end_date = datetime.now() + timedelta(days=30)
                 user['career_end_date'] = end_date.isoformat()
                 save_data(USERS_FILE, self.users)
-                
                 await context.bot.send_message(
                     chat_id=int(target_user_id),
-                    text=f"❌ Ваш запрос на возвращение карьеры отклонен!\n\n📝 Причина: {reason}\n\n❌ Отклонил: @{admin_name}\n\n⚠️ Ваша карьера продлена еще на 30 дней!\n📅 Новая дата окончания: {end_date.strftime('%d.%m.%Y')}"
+                    text=f"❌ Ваш запрос на возвращение карьеры отклонен!\n\n📝 Причина: {reason}{suffix}\n\n⚠️ Ваша карьера продлена еще на 30 дней!\n📅 Новая дата окончания: {end_date.strftime('%d.%m.%Y')}"
                 )
             else:
-                await context.bot.send_message(
-                    chat_id=int(target_user_id),
-                    text=f"❌ Ваш запрос на завершение карьеры отклонен!\n\n📝 Причина: {reason}\n\n❌ Отклонил: @{admin_name}"
-                )
+                await context.bot.send_message(chat_id=int(target_user_id), text=f"❌ Ваш запрос на завершение карьеры отклонен!\n\n📝 Причина: {reason}{suffix}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
-    
+
     async def ignore_career(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         admin_id = str(query.from_user.id)
@@ -4775,7 +7031,7 @@ class FootballBot:
         await query.edit_message_text(f"{query.message.text}\n\n😴 ПРОИГНОРИРОВАНО @{admin_name}")
         
         try:
-            await context.bot.send_message(chat_id=int(request['user_id']), text=f"😴 Ваш запрос проигнорирован администратором!\n\n😴 Проигнорировал: @{admin_name}")
+            await context.bot.send_message(chat_id=int(request['user_id']), text=f"😴 Ваш запрос проигнорирован администратором!{premium_moderator_suffix(request['user_id'], 'ignored', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -4789,37 +7045,26 @@ class FootballBot:
         await self.ignore_career(update, context)
     
     async def reject_nick_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        admin_id = str(query.from_user.id)
+        admin_id = str(update.effective_user.id)
         admin_name = update.effective_user.username
         request_id = context.user_data.get('reject_request_id')
         reason = context.user_data.get('reject_reason_text', 'Не указана')
-        original_message = context.user_data.get('reject_original_message')
-        
-        if request_id not in self.nick_requests:
-            await query.edit_message_text("❌ Запрос не найден!")
+        request = self.nick_requests.get(request_id)
+        if not request:
+            await update.message.reply_text("❌ Запрос не найден!")
             return
-        
-        request = self.nick_requests[request_id]
         if request.get('status') != 'pending':
-            await query.edit_message_text("❌ Этот запрос уже был обработан!")
+            await update.message.reply_text("❌ Этот запрос уже был обработан!")
             return
-        
-        request['status'] = 'rejected'
-        request['rejected_by'] = admin_id
-        request['rejected_at'] = datetime.now().isoformat()
+        request.update(status='rejected', rejected_by=admin_id, rejected_at=datetime.now().isoformat())
         save_data(NICK_CHANGE_REQUESTS_FILE, self.nick_requests)
-        
-        if original_message:
-            await original_message.edit_text(f"{original_message.text}\n\n❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-        else:
-            await query.edit_message_text(f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-        
+        await self._finish_rejection(update, context, f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
         try:
-            await context.bot.send_message(chat_id=int(request['user_id']), text=f"❌ Ваш запрос на смену ника отклонен!\n\n📝 Причина: {reason}\n\n❌ Отклонил: @{admin_name}")
+            suffix = premium_moderator_suffix(request['user_id'], "rejected", admin_name)
+            await context.bot.send_message(chat_id=int(request['user_id']), text=f"❌ Ваш запрос на смену ника отклонен!\n\n📝 Причина: {reason}{suffix}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
-    
+
     async def ignore_nick_change(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         admin_id = str(query.from_user.id)
@@ -4848,7 +7093,7 @@ class FootballBot:
         await query.edit_message_text(f"{query.message.text}\n\n😴 ПРОИГНОРИРОВАНО @{admin_name}")
         
         try:
-            await context.bot.send_message(chat_id=int(request['user_id']), text=f"😴 Ваш запрос на смену ника проигнорирован администратором!\n\n😴 Проигнорировал: @{admin_name}")
+            await context.bot.send_message(chat_id=int(request['user_id']), text=f"😴 Ваш запрос на смену ника проигнорирован администратором!{premium_moderator_suffix(request['user_id'], 'ignored', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
     
@@ -4885,6 +7130,12 @@ class FootballBot:
                 return
             players_count = get_club_players_count(target_name, self.users)
             if players_count >= MAX_PLAYERS_PER_CLUB:
+                return False, f"❌ В клубе {target_name} уже {MAX_PLAYERS_PER_CLUB} игроков!"
+            allowed_by_nation_rule, nation_rule_error = can_assign_player_to_club(user_id, target_name, self.users)
+            if not allowed_by_nation_rule:
+                await query.edit_message_text(nation_rule_error)
+                return
+            if players_count >= MAX_PLAYERS_PER_CLUB:
                 await query.edit_message_text(f"❌ В клубе {target_name} уже {MAX_PLAYERS_PER_CLUB} игроков!")
                 return
             target_user = self.users.get(user_id, {})
@@ -4896,6 +7147,12 @@ class FootballBot:
             target_user['last_transfer_club_date'] = datetime.now().isoformat()
         else:
             players_count = get_nation_players_count(target_name, self.users)
+            if players_count >= MAX_PLAYERS_PER_NATION:
+                return False, f"❌ В сборной {target_name} уже {MAX_PLAYERS_PER_NATION} игроков!"
+            allowed_by_club_rule, club_rule_error = can_assign_player_to_nation(user_id, target_name, self.users)
+            if not allowed_by_club_rule:
+                await query.edit_message_text(club_rule_error)
+                return
             if players_count >= MAX_PLAYERS_PER_NATION:
                 await query.edit_message_text(f"❌ В сборной {target_name} уже {MAX_PLAYERS_PER_NATION} игроков!")
                 return
@@ -4918,12 +7175,12 @@ class FootballBot:
         self.add_transfer_to_history(user_id, request['player_nick'], old_name, target_name, admin_id, transfer_type, request.get('position'))
         
         try:
-            await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваш переход одобрен!\n\n✅ Одобрил: @{admin_name}")
+            await context.bot.send_message(chat_id=int(user_id), text=f"✅ Ваш переход одобрен!{premium_moderator_suffix(user_id, 'approved', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления игрока: {e}")
         
         try:
-            await context.bot.send_message(chat_id=int(from_owner_id), text=f"✅ Игрок {request['player_nick']} успешно перешел в вашу команду!\n\n✅ Одобрил: @{admin_name}")
+            await context.bot.send_message(chat_id=int(from_owner_id), text=f"✅ Игрок {request['player_nick']} успешно перешел в вашу команду!{premium_moderator_suffix(from_owner_id, 'approved', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления владельца: {e}")
         
@@ -4946,42 +7203,30 @@ class FootballBot:
         await query.edit_message_text(f"{query.message.text}\n\n✅ ОДОБРЕНО @{admin_name}")
     
     async def reject_transfer(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        admin_id = str(query.from_user.id)
+        admin_id = str(update.effective_user.id)
         admin_name = update.effective_user.username
         request_id = context.user_data.get('reject_request_id')
         reason = context.user_data.get('reject_reason_text', 'Не указана')
-        original_message = context.user_data.get('reject_original_message')
-        
-        if request_id not in self.transfer_requests:
-            await query.edit_message_text("❌ Запрос не найден!")
+        request = self.transfer_requests.get(request_id)
+        if not request:
+            await update.message.reply_text("❌ Запрос не найден!")
             return
-        
-        request = self.transfer_requests[request_id]
         if request.get('status') != 'pending':
-            await query.edit_message_text("❌ Этот запрос уже был обработан!")
+            await update.message.reply_text("❌ Этот запрос уже был обработан!")
             return
-        
-        request['status'] = 'rejected'
-        request['rejected_by'] = admin_id
-        request['rejected_at'] = datetime.now().isoformat()
+        request.update(status='rejected', rejected_by=admin_id, rejected_at=datetime.now().isoformat())
         save_data(TRANSFER_REQUESTS_FILE, self.transfer_requests)
-        
-        if original_message:
-            await original_message.edit_text(f"{original_message.text}\n\n❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-        else:
-            await query.edit_message_text(f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
-        
-        try:
-            await context.bot.send_message(chat_id=int(request['user_id']), text=f"❌ Ваш запрос на переход отклонен!\n\n📝 Причина: {reason}\n\n❌ Отклонил: @{admin_name}")
-        except Exception as e:
-            logger.error(f"Ошибка уведомления пользователя: {e}")
-        
-        try:
-            await context.bot.send_message(chat_id=int(request['owner_id']), text=f"❌ Запрос на переход игрока отклонен!\n\n📝 Причина: {reason}\n\n❌ Отклонил: @{admin_name}")
-        except Exception as e:
-            logger.error(f"Ошибка уведомления владельца: {e}")
-    
+        await self._finish_rejection(update, context, f"❌ ОТКЛОНЕНО @{admin_name}\n📝 Причина: {reason}")
+        for target_id, message in (
+            (request['user_id'], "❌ Ваш запрос на переход отклонен!"),
+            (request['owner_id'], "❌ Запрос на переход игрока отклонен!")
+        ):
+            try:
+                suffix = premium_moderator_suffix(target_id, "rejected", admin_name)
+                await context.bot.send_message(chat_id=int(target_id), text=f"{message}\n\n📝 Причина: {reason}{suffix}")
+            except Exception as e:
+                logger.error(f"Ошибка уведомления пользователя: {e}")
+
     async def ignore_transfer(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         admin_id = str(query.from_user.id)
@@ -5010,12 +7255,12 @@ class FootballBot:
         await query.edit_message_text(f"{query.message.text}\n\n😴 ПРОИГНОРИРОВАНО @{admin_name}")
         
         try:
-            await context.bot.send_message(chat_id=int(request['user_id']), text=f"😴 Ваш запрос на переход проигнорирован администратором!\n\n😴 Проигнорировал: @{admin_name}")
+            await context.bot.send_message(chat_id=int(request['user_id']), text=f"😴 Ваш запрос на переход проигнорирован администратором!{premium_moderator_suffix(request['user_id'], 'ignored', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления пользователя: {e}")
         
         try:
-            await context.bot.send_message(chat_id=int(request['owner_id']), text=f"😴 Запрос на переход игрока проигнорирован администратором!\n\n😴 Проигнорировал: @{admin_name}")
+            await context.bot.send_message(chat_id=int(request['owner_id']), text=f"😴 Запрос на переход игрока проигнорирован администратором!{premium_moderator_suffix(request['owner_id'], 'ignored', admin_name)}")
         except Exception as e:
             logger.error(f"Ошибка уведомления владельца: {e}")
     
@@ -5032,6 +7277,9 @@ class FootballBot:
             
             old_name = user.get('club', 'Свободный агент')
             players_count = get_club_players_count(target_name, self.users)
+            allowed_by_nation_rule, nation_rule_error = can_assign_player_to_club(user_id, target_name, self.users)
+            if not allowed_by_nation_rule:
+                return False, nation_rule_error
             frozen, _ = is_club_frozen(target_name)
             if frozen:
                 return False, f"❌ Клуб {target_name} заморожен!"
@@ -5044,6 +7292,9 @@ class FootballBot:
             
             old_name = user.get('nation', 'Свободный агент')
             players_count = get_nation_players_count(target_name, self.users)
+            allowed_by_club_rule, club_rule_error = can_assign_player_to_nation(user_id, target_name, self.users)
+            if not allowed_by_club_rule:
+                return False, club_rule_error
             can_transfer, time_left = self.can_transfer_nation(user_id)
             if not can_transfer:
                 return False, f"❌ Вы не можете перейти в сборную! Осталось: {time_left} ч."
@@ -5051,7 +7302,7 @@ class FootballBot:
         if not are_announcements_open():
             return False, "🔒 В настоящее время администраторы не принимают заявки. Попробуйте позже."
         
-        request_id = str(len(self.transfer_requests) + 1)
+        request_id = new_request_id(self.transfer_requests)
         
         admin_text = f"‼️ Новое объявление!\n\n📢 Тип: Трансфер\n👤 От: @{update.effective_user.username}\n🆔 ID: {make_copyable(user_id)}\n\n💠Ник: {user.get('roblox_nick')}\n{old_name} ➡️ {target_name}\n\n👑 Владелец: @{self.users[from_owner_id].get('username')}\n🆔 Его айди: {make_copyable(from_owner_id)}"
         
@@ -5083,12 +7334,117 @@ class FootballBot:
         query = update.callback_query
         user_id = str(query.from_user.id)
         
-        await query.answer()
-        
-        if is_banned(int(user_id)):
-            await query.edit_message_text("❌ Вы забанены в боте.")
+        self.touch_user_activity(query.from_user)
+
+        # Пользовательские меню и регистрационные кнопки работают только в ЛС.
+        # В группах разрешены только служебные кнопки обработки заявок модераторами.
+        group_action_prefixes = (
+            "approve_",
+            "reject_",
+            "ignore_",
+            "moder_reply_",
+            "moder_reject_",
+            "moder_ignore_",
+            "history_",
+        )
+        if update.effective_chat.type != 'private' and not query.data.startswith(group_action_prefixes):
+            await query.answer(
+                "❌ Меню доступно только в личных сообщениях с ботом.",
+                show_alert=True
+            )
             return
-        
+
+        if query.data == "donate_menu":
+            await query.answer()
+            await self.show_donate_menu(update, context)
+            return
+        if query.data in {"donate_restore", "donate_cooldown", "donate_unban", "donate_premium"}:
+            await self.create_donation_invoice(update, context, query.data.replace("donate_", ""))
+            return
+        if query.data == "history_index":
+            await query.answer()
+            await self.show_history_index(update, context)
+            return
+        if query.data.startswith("history_month:"):
+            await query.answer()
+            try:
+                _, month_key, page_text = query.data.split(":", 2)
+                page = int(page_text)
+            except (ValueError, TypeError):
+                await query.edit_message_text("<b>❌ Некорректная страница истории.</b>", parse_mode="HTML")
+                return
+            await self.show_history_month(update, context, month_key, page)
+            return
+        if query.data.startswith(("moder_reply_", "moder_reject_", "moder_ignore_")):
+            await self.handle_moder_complaint_callback(update, context)
+            return
+
+        await query.answer()
+        if is_banned(int(user_id)):
+            await query.edit_message_text(
+                "<b>❌ Вы забанены в боте.</b>",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Купить разбан — 50 ⭐", callback_data="donate_unban")]]),
+                parse_mode='HTML'
+            )
+            return
+
+        if query.data in {
+            "registration_pos_forward",
+            "registration_pos_midfielder",
+            "registration_pos_universal",
+            "registration_pos_goalkeeper",
+        }:
+            position_map = {
+                "registration_pos_forward": "⚽ Нападающий",
+                "registration_pos_midfielder": "🎯 Полузащитник",
+                "registration_pos_universal": "🔄 Универсал",
+                "registration_pos_goalkeeper": "🧤 Вратарь",
+            }
+            self.users[user_id]["position"] = position_map[query.data]
+            self.users[user_id]["registration_stage"] = "team"
+            save_data(USERS_FILE, self.users)
+            await self.show_registration_team_offer(update, context)
+            return
+        elif query.data in {"registration_team_offer", "registration_back_team"}:
+            await self.show_registration_team_offer(update, context)
+            return
+        elif query.data == "registration_find_club":
+            if not are_announcements_open():
+                await query.edit_message_text(
+                    "<b>🔒 Заявки сейчас закрыты.</b>\n\nВы сможете найти клуб позже через главное меню.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Пропустить", callback_data="registration_skip_team")]]),
+                    parse_mode="HTML"
+                )
+                return
+            if not query.from_user.username:
+                await query.edit_message_text(
+                    "<b>❌ Для поиска клуба нужен @Username в Telegram.</b>\n\n"
+                    "Установите username в настройках Telegram, затем сможете отправить заявку через главное меню.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Пропустить", callback_data="registration_skip_team")]]),
+                    parse_mode="HTML"
+                )
+                return
+            self.users[user_id]["registration_stage"] = "club_requirements"
+            save_data(USERS_FILE, self.users)
+            context.user_data.clear()
+            context.user_data["waiting_for"] = "registration_search_requirements"
+            await query.edit_message_text(
+                "<b>🔍 ПОИСК КЛУБА</b>\n\nОпишите требования к будущему клубу:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="registration_team_offer")]]),
+                parse_mode="HTML"
+            )
+            return
+        elif query.data == "registration_skip_team":
+            await self.show_registration_features(update, context)
+            return
+        elif query.data == "registration_continue":
+            self.users[user_id]["registration_completed"] = True
+            self.users[user_id]["registration_stage"] = "completed"
+            save_data(USERS_FILE, self.users)
+            context.user_data.clear()
+            await self.show_main_menu(update, context)
+            return
+
         if query.data == "ad_menu":
             await self.ad_menu(update, context)
         elif query.data == "ad_recruitment_club":
@@ -5134,6 +7490,12 @@ class FootballBot:
         elif query.data.startswith("clubpanel_kick_"):
             club_name = query.data.replace("clubpanel_kick_", "")
             await self.clubpanel_kick(update, context, club_name)
+        elif query.data.startswith("close_club_confirm_"):
+            club_name = query.data.replace("close_club_confirm_", "")
+            await self.close_club_confirmation(update, context, club_name)
+        elif query.data.startswith("close_club_yes_"):
+            club_name = query.data.replace("close_club_yes_", "")
+            await self.close_club(update, context, club_name)
         elif query.data.startswith("club_back_"):
             club_name = query.data.replace("club_back_", "")
             await self.show_club_panel(update, context, club_name)
@@ -5146,7 +7508,7 @@ class FootballBot:
             else:
                 for transfer in history[:30]:
                     date = datetime.fromisoformat(transfer.get("timestamp", "")).strftime('%d.%m.%Y')
-                    pos_emoji = "⚽" if "Нападающий" in transfer.get('position', '') else "🔄" if "Полузащитник" in transfer.get('position', '') else "🧤" if "Вратарь" in transfer.get('position', '') else "❓"
+                    pos_emoji = "⚽" if "Нападающий" in transfer.get('position', '') else "🎯" if "Полузащитник" in transfer.get('position', '') else "🔄" if "Универсал" in transfer.get('position', '') else "🧤" if "Вратарь" in transfer.get('position', '') else "❓"
                     text += f"📥 {date} {pos_emoji} - {transfer.get('player')} из {transfer.get('from_club')}\n"
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"club_back_{club_name}")]]))
         elif query.data.startswith("club_filter_departures_"):
@@ -5158,7 +7520,7 @@ class FootballBot:
             else:
                 for transfer in history[:30]:
                     date = datetime.fromisoformat(transfer.get("timestamp", "")).strftime('%d.%m.%Y')
-                    pos_emoji = "⚽" if "Нападающий" in transfer.get('position', '') else "🔄" if "Полузащитник" in transfer.get('position', '') else "🧤" if "Вратарь" in transfer.get('position', '') else "❓"
+                    pos_emoji = "⚽" if "Нападающий" in transfer.get('position', '') else "🎯" if "Полузащитник" in transfer.get('position', '') else "🔄" if "Универсал" in transfer.get('position', '') else "🧤" if "Вратарь" in transfer.get('position', '') else "❓"
                     text += f"📤 {date} {pos_emoji} - {transfer.get('player')} в {transfer.get('to_club')}\n"
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"club_back_{club_name}")]]))
         elif query.data.startswith("kick_club_"):
@@ -5276,42 +7638,68 @@ class FootballBot:
             context.args = []
             await self.profile_command(update, context)
         elif query.data == "back_to_menu":
+            # Возврат отменяет незавершённый ввод/отклонение, чтобы следующее
+            # сообщение пользователя не попало в старый сценарий.
+            context.user_data.clear()
             await self.show_main_menu(update, context)
+        elif query.data == "cis_top":
+            await self.show_cis_top_menu(update, context)
         elif query.data == "settings":
-            keyboard = [
-                [InlineKeyboardButton("✏️ Сменить ник", callback_data="change_nick")],
-                [InlineKeyboardButton("💠 Выбрать позицию", callback_data="set_position")],
-                [InlineKeyboardButton("🔄 Обновить username", callback_data="update_username")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]
-            ]
-            await query.edit_message_text("⚙️ НАСТРОЙКИ", reply_markup=InlineKeyboardMarkup(keyboard))
+            await self.show_settings_menu(update, context)
+        elif query.data == "toggle_cis_top_notifications":
+            user = ensure_user_record(self.users, user_id)
+            user["cis_top_notifications"] = not user.get("cis_top_notifications", False)
+            save_data(USERS_FILE, self.users)
+            await self.show_settings_menu(update, context)
+        elif query.data == "toggle_cis_match_notifications":
+            if not is_premium(int(user_id)):
+                await query.edit_message_text(
+                    "<b>💎 Уведомления о матчах и страйках доступны только премиум-пользователям.</b>",
+                    reply_markup=back_keyboard("settings"),
+                    parse_mode="HTML"
+                )
+                return
+            user = ensure_user_record(self.users, user_id)
+            user["cis_match_notifications"] = not user.get("cis_match_notifications", False)
+            save_data(USERS_FILE, self.users)
+            await self.show_settings_menu(update, context)
         elif query.data == "change_nick":
             await self.request_nick_change(update, context)
         elif query.data == "set_position":
-            keyboard = [
-                [InlineKeyboardButton("⚽ Нападающий", callback_data="pos_forward")],
-                [InlineKeyboardButton("🔄 Полузащитник", callback_data="pos_midfielder")],
-                [InlineKeyboardButton("🧤 Вратарь", callback_data="pos_goalkeeper")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="settings")]
+            buttons = [
+                InlineKeyboardButton("⚽ Нападающий", callback_data="pos_forward"),
+                InlineKeyboardButton("🎯 Полузащитник", callback_data="pos_midfielder"),
+                InlineKeyboardButton("🔄 Универсал", callback_data="pos_universal"),
+                InlineKeyboardButton("🧤 Вратарь", callback_data="pos_goalkeeper"),
+                InlineKeyboardButton("◀️ Назад", callback_data="settings"),
             ]
-            await query.edit_message_text("Выберите позицию:", reply_markup=InlineKeyboardMarkup(keyboard))
+            await query.edit_message_text("<b>💠 ВЫБЕРИТЕ ПОЗИЦИЮ</b>", reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons)), parse_mode='HTML')
         elif query.data.startswith("pos_"):
-            pos_map = {"pos_forward": "⚽ Нападающий", "pos_midfielder": "🔄 Полузащитник", "pos_goalkeeper": "🧤 Вратарь"}
+            pos_map = {
+                "pos_forward": "⚽ Нападающий",
+                "pos_midfielder": "🎯 Полузащитник",
+                "pos_universal": "🔄 Универсал",
+                "pos_goalkeeper": "🧤 Вратарь"
+            }
             position = pos_map.get(query.data, "Не выбрана")
             self.users[user_id]["position"] = position
             save_data(USERS_FILE, self.users)
-            await query.edit_message_text(f"✅ Позиция: {position}")
+            await query.edit_message_text(
+                f"<b>✅ ПОЗИЦИЯ ОБНОВЛЕНА</b>\n\n"
+                f"💠 Основная позиция: <b>{escape(position)}</b>",
+                parse_mode="HTML"
+            )
             await self.show_main_menu(update, context)
         elif query.data == "support_menu":
-            keyboard = [
-                [InlineKeyboardButton("📝 Написать", callback_data="support_new")],
-                [InlineKeyboardButton("📋 Мои обращения", callback_data="support_my")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]
+            buttons = [
+                InlineKeyboardButton("📝 Написать", callback_data="support_new"),
+                InlineKeyboardButton("📋 Мои обращения", callback_data="support_my"),
+                InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"),
             ]
-            await query.edit_message_text("🆘 ТЕХПОДДЕРЖКА", reply_markup=InlineKeyboardMarkup(keyboard))
+            await query.edit_message_text("<b><u>🆘 ТЕХПОДДЕРЖКА</u></b>", reply_markup=InlineKeyboardMarkup(two_column_keyboard(buttons)), parse_mode='HTML')
         elif query.data == "support_new":
             context.user_data['waiting_for'] = 'support'
-            await query.edit_message_text("📝 Опишите вашу проблему:")
+            await query.edit_message_text("<b>📝 НОВОЕ ОБРАЩЕНИЕ</b>\n\n<i>Опишите вашу проблему:</i>", reply_markup=back_keyboard("support_menu"), parse_mode='HTML')
         elif query.data == "support_my":
             user_support = [s for s in self.support.values() if s['user_id'] == user_id]
             if not user_support:
@@ -5325,18 +7713,18 @@ class FootballBot:
             keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="support_menu")]]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         elif query.data == "help":
-            text = "ℹ️ ПОМОЩЬ\n\n🔍 Ищу клуб/сборную - поиск новой команды\n👤 Профиль - ваши данные\n⚙️ Настройки - ник и позиция\n📢 Объявление - написать\n🥀 Завершить карьеру - пауза 30 дней\n🆘 Техподдержка - помощь\n\n📋 КОМАНДЫ:\n/start - главное меню\n/clubs - список всех клубов\n/nations - список всех сборных\n/club [название] - информация о клубе\n/nation [название] - информация о сборной\n/profile [ник/id] - просмотр профиля\n/transfer_cl - пригласить в клуб (для владельцев клубов)\n/transfer_nt - пригласить в сборную (для владельцев сборных)"
-            keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await self.help_command(update, context)
+        elif query.data == "moders":
+            await self.moders_command(update, context)
         elif query.data == "admin_users":
             if not is_admin(int(user_id)):
                 await query.edit_message_text("❌ Нет доступа")
                 return
             text = "👥 ПОЛЬЗОВАТЕЛИ:\n\n"
             for uid, user in list(self.users.items())[:20]:
-                text += f"🆔 {uid} - @{user.get('username', '')} - {user.get('roblox_nick', '')}\n"
+                text += f"🆔 <code>{escape(str(uid))}</code> — @{escape(str(user.get('username', '')))} — <b>{escape(str(user.get('roblox_nick', '')))}</b>\n"
             keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="admin")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         elif query.data == "ended_careers_list":
             if not is_admin(int(user_id)):
                 await query.edit_message_text("❌ Нет доступа")
@@ -5359,9 +7747,9 @@ class FootballBot:
                 return
             text = "🥀 ЗАВЕРШЕННЫЕ КАРЬЕРЫ:\n\n"
             for uid, user, days in ended_careers[:20]:
-                text += f"🆔 {uid} - {user.get('roblox_nick', '')} (@{user.get('username', '')})\n   ⏳ Возврат через: {days} дн.\n\n"
+                text += f"🆔 <code>{escape(str(uid))}</code> — <b>{escape(str(user.get('roblox_nick', '')))}</b> (@{escape(str(user.get('username', '')))})\n   ⏳ Возврат через: <code>{days}</code> дн.\n\n"
             keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="admin")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         elif query.data == "banned_users_list":
             if not is_admin(int(user_id)):
                 await query.edit_message_text("❌ Нет доступа")
@@ -5382,14 +7770,14 @@ class FootballBot:
                     else:
                         days_left = ban_info.get("days", 0)
                         ban_term = f" (на {days_left} дн.)"
-                    text += f"🆔 {uid} - @{user.get('username', '')} - {user.get('roblox_nick', '')}{ban_term}\n"
+                    text += f"🆔 <code>{escape(str(uid))}</code> — @{escape(str(user.get('username', '')))} — <b>{escape(str(user.get('roblox_nick', '')))}</b>{escape(str(ban_term))}\n"
                     text += f"   📝 Причина: {ban_info.get('reason', 'Не указана')}\n"
                     text += f"   📅 Дата: {datetime.fromisoformat(ban_info.get('date')).strftime('%d.%m.%Y %H:%M') if ban_info.get('date') else 'Неизвестно'}\n"
                     text += f"   👮 Админ: @{ban_info.get('admin_name', 'Неизвестно')}\n\n"
                 else:
-                    text += f"🆔 {uid}\n\n"
+                    text += f"🆔 <code>{escape(str(uid))}</code>\n\n"
             keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="admin")]]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         elif query.data == "career_info":
             user = self.users.get(user_id, {})
             if user.get('career_end_date'):
@@ -5402,6 +7790,9 @@ class FootballBot:
             else:
                 await query.edit_message_text("⏳ Карьера завершена")
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Ошибка в обработчике Telegram", exc_info=context.error)
+
 def main():
     global bot_instance, application_instance, shutdown_completed
     
@@ -5409,7 +7800,8 @@ def main():
              SUPPORT_FILE, BANS_FILE, HISTORY_FILE, NICK_CHANGE_REQUESTS_FILE, 
              TRANSFER_REQUESTS_FILE, CAREER_REQUESTS_FILE, MATCH_REQUESTS_FILE,
              OWNER_CHANGE_REQUESTS_FILE, PREMIUM_USERS_FILE, FROZEN_CLUBS_FILE,
-             SEARCH_REQUESTS_FILE, TESTERS_FILE, AWARDS_FILE, ANNOUNCEMENTS_SETTINGS_FILE]
+             SEARCH_REQUESTS_FILE, TESTERS_FILE, AWARDS_FILE, ANNOUNCEMENTS_SETTINGS_FILE,
+             REGISTRY_FILE, LEAGUES_FILE, NOOFFICIAL_LEAGUES_FILE, MODER_COMPLAINTS_FILE, PAYMENTS_FILE]
     
     for file in files:
         if not os.path.exists(file):
@@ -5432,6 +7824,14 @@ def main():
                     json.dump({}, f, ensure_ascii=False, indent=4)
                 elif file == ANNOUNCEMENTS_SETTINGS_FILE:
                     json.dump({"announcements_open": True}, f, ensure_ascii=False, indent=4)
+                elif file == REGISTRY_FILE:
+                    json.dump({"clubs": CLUBS_STRUCTURE.copy(), "nations": NATIONS_STRUCTURE.copy()}, f, ensure_ascii=False, indent=4)
+                elif file in {LEAGUES_FILE, NOOFFICIAL_LEAGUES_FILE}:
+                    json.dump({"leagues": []}, f, ensure_ascii=False, indent=4)
+                elif file == MODER_COMPLAINTS_FILE:
+                    json.dump({}, f, ensure_ascii=False, indent=4)
+                elif file == PAYMENTS_FILE:
+                    json.dump({"processed": {}}, f, ensure_ascii=False, indent=4)
                 else:
                     json.dump({}, f, ensure_ascii=False, indent=4)
     
@@ -5441,6 +7841,13 @@ def main():
         save_data(ADMINS_FILE, admins_data)
         print(f"✅ Добавлен создатель {CREATOR_ID} в админы")
     
+    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬ_СЮДА_НОВЫЙ_ТОКЕН":
+        raise RuntimeError("Укажите новый токен бота: переменная окружения BOT_TOKEN или строка BOT_TOKEN в коде")
+
+    registry_data = load_data(REGISTRY_FILE, {"clubs": CLUBS_STRUCTURE.copy(), "nations": NATIONS_STRUCTURE.copy()})
+    CLUBS_STRUCTURE[:] = registry_data.get("clubs", CLUBS_STRUCTURE)
+    NATIONS_STRUCTURE[:] = registry_data.get("nations", NATIONS_STRUCTURE)
+
     application = Application.builder().token(BOT_TOKEN).build()
     bot = FootballBot()
     
@@ -5460,9 +7867,12 @@ def main():
     console_thread = threading.Thread(target=console_input_listener, daemon=True)
     console_thread.start()
     
+    # Все команды зарегистрированы для личных и групповых чатов.
+    # Ограничение на ЛС применяется внутри /start и пользовательских меню.
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("clubs", bot.clubs_command))
     application.add_handler(CommandHandler("nations", bot.nations_command))
+    application.add_handler(CommandHandler("top_cis", bot.cis_top_command))
     application.add_handler(CommandHandler("club", bot.club_info_command))
     application.add_handler(CommandHandler("nation", bot.nation_info_command))
     application.add_handler(CommandHandler("profile", bot.profile_command))
@@ -5481,9 +7891,36 @@ def main():
     application.add_handler(CommandHandler("post_bot", bot.post_to_all))
     application.add_handler(CommandHandler("ban", bot.ban_user))
     application.add_handler(CommandHandler("unban", bot.unban_user))
+    application.add_handler(CommandHandler("retire", bot.player_end_career))
+    application.add_handler(CommandHandler("unretire", bot.player_restore_career))
+    # Старые команды оставлены как скрытые алиасы, чтобы ничего не сломать.
     application.add_handler(CommandHandler("player_end", bot.player_end_career))
     application.add_handler(CommandHandler("player_noend", bot.player_restore_career))
+    application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(CommandHandler("help_adm", bot.help_admins_command))
     application.add_handler(CommandHandler("help_admins", bot.help_admins_command))
+    application.add_handler(CommandHandler("moders", bot.moders_command))
+    application.add_handler(CommandHandler("support_moder", bot.support_moder_command))
+    application.add_handler(CommandHandler("official_league", bot.official_league_command))
+    application.add_handler(CommandHandler("update_league", bot.update_league_command))
+    application.add_handler(CommandHandler("add_league", bot.add_league_command))
+    application.add_handler(CommandHandler("remove_league", bot.remove_league_command))
+    application.add_handler(CommandHandler("rename_league", bot.rename_league_command))
+    application.add_handler(CommandHandler("noofficial_league", bot.noofficial_league_command))
+    application.add_handler(CommandHandler("update_noofleague", bot.update_noofleague_command))
+    application.add_handler(CommandHandler("add_noofleague", bot.add_noofleague_command))
+    application.add_handler(CommandHandler("remove_noofleague", bot.remove_noofleague_command))
+    application.add_handler(CommandHandler("rename_noofleague", bot.rename_noofleague_command))
+    application.add_handler(CommandHandler("open_application", bot.open_application_command))
+    application.add_handler(CommandHandler("close_application", bot.close_application_command))
+    application.add_handler(CommandHandler("rename_c", bot.rename_club_command))
+    application.add_handler(CommandHandler("rename_n", bot.rename_nation_command))
+    application.add_handler(CommandHandler("match", bot.cis_match_command))
+    application.add_handler(CommandHandler("set_top_cis", bot.set_cis_top_command))
+    application.add_handler(CommandHandler("swap_top_cis", bot.swap_cis_top_command))
+    application.add_handler(CommandHandler("reset_top_cis", bot.reset_cis_top_command))
+    application.add_handler(CommandHandler("top_streaks", bot.cis_streaks_command))
+    application.add_handler(CommandHandler("donate", bot.donate_command))
     application.add_handler(CommandHandler("add_admins", bot.add_admin))
     application.add_handler(CommandHandler("remove_admins", bot.remove_admin))
     application.add_handler(CommandHandler("off_coldaun", bot.off_coldown))
@@ -5505,9 +7942,15 @@ def main():
     application.add_handler(CommandHandler("zamoroz_c", bot.freeze_club_command))
     application.add_handler(CommandHandler("razmoroz_c", bot.unfreeze_club_command))
     
+    application.add_handler(CommandHandler("history", bot.history_command))
     application.add_handler(CommandHandler("history_player", bot.history_player_command))
     application.add_handler(CommandHandler("history_club", bot.history_club_command))
     
+    application.add_error_handler(error_handler)
+    application.add_handler(MessageHandler(filters.ALL, bot.track_activity), group=-1)
+    application.add_handler(CallbackQueryHandler(bot.track_activity), group=-1)
+    application.add_handler(PreCheckoutQueryHandler(bot.precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, bot.successful_payment_callback))
     application.add_handler(CallbackQueryHandler(bot.button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     
@@ -5540,6 +7983,7 @@ def main():
     print(f"⏳ Кулдаун на поиск: {SEARCH_COOLDOWN_HOURS} часа")
     print(f"📢 Лимит объявлений о наборе: {RECRUITMENT_LIMIT_PER_DAY} в день")
     print("✅ Все команды зарегистрированы")
+    print("⭐ Для доната через Telegram Stars нужна python-telegram-bot версии 21.4 или новее")
     
     try:
         application.run_polling()
